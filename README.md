@@ -73,3 +73,4 @@ pytest
 ## Status
 
 Only the initial skeleton is implemented. The current code provides module boundaries, dataclasses, placeholder abstractions, and a tiny demo path. It does not yet implement the paper's compression algorithm.
+# Research-Low-bit-Communication-for-Tensor-Parallel-LLM-Inference
