@@ -12,6 +12,8 @@ from .calibration import EMAMinMaxCalibrator
 from .tp_linear import (
     HybridQuantizedRowParallelConv1D,
     HybridQuantizedRowParallelLinear,
+    RowParallelConv1D,
+    RowParallelLinear,
     make_random_bf16_indices,
 )
 
@@ -131,6 +133,64 @@ class ActivationCapture:
         return list(self.outputs.get(module_name, []))
 
 
+class ModuleInputOutputCapture:
+    """Capture module inputs via pre-hooks and outputs via forward hooks."""
+
+    def __init__(self, model: nn.Module, module_names: Sequence[str]) -> None:
+        self.module_names = list(module_names)
+        self.inputs: dict[str, list[Tensor]] = defaultdict(list)
+        self.outputs: dict[str, list[Tensor]] = defaultdict(list)
+        self._handles: list[RemovableHandle] = []
+
+        wanted = set(self.module_names)
+        found = set()
+        for name, module in model.named_modules():
+            if name in wanted:
+                self._handles.append(module.register_forward_pre_hook(self._make_pre_hook(name)))
+                self._handles.append(module.register_forward_hook(self._make_post_hook(name)))
+                found.add(name)
+
+        missing = sorted(wanted - found)
+        if missing:
+            self.remove()
+            raise ValueError(f"Unknown module names for input/output capture: {missing}")
+
+    def _make_pre_hook(self, module_name: str):
+        def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+            if not inputs:
+                return
+            tensor = inputs[0]
+            if not isinstance(tensor, torch.Tensor):
+                return
+            self.inputs[module_name].append(tensor.detach().cpu())
+
+        return hook
+
+    def _make_post_hook(self, module_name: str):
+        def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            tensor = output[0] if isinstance(output, tuple) else output
+            if not isinstance(tensor, torch.Tensor):
+                return
+            self.outputs[module_name].append(tensor.detach().cpu())
+
+        return hook
+
+    def clear(self) -> None:
+        self.inputs.clear()
+        self.outputs.clear()
+
+    def remove(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def get_inputs(self, module_name: str) -> list[Tensor]:
+        return list(self.inputs.get(module_name, []))
+
+    def get_outputs(self, module_name: str) -> list[Tensor]:
+        return list(self.outputs.get(module_name, []))
+
+
 def _resolve_child_module(parent: nn.Module, child_name: str) -> nn.Module:
     if child_name.isdigit():
         return parent[int(child_name)]  # type: ignore[index]
@@ -174,7 +234,7 @@ def build_hybrid_replacements_from_calibration(
 
     if mode == "full":
         return {}
-    if mode not in {"int4", "selected_bf16", "random_bf16"}:
+    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16"}:
         raise ValueError(f"Unsupported mode: {mode}.")
 
     replacements: dict[str, nn.Module] = {}
@@ -189,6 +249,10 @@ def build_hybrid_replacements_from_calibration(
             # Calibration was collected with a single simulated partition. Real TP
             # deployment would need per-partition statistics; for now we repeat the
             # single-partition scale across simulated partitions.
+            print(
+                "Warning: repeating full-output calibration scales across partitions; "
+                "this is less faithful than simulated row-parallel calibration."
+            )
             scales = scales.repeat(num_partitions, 1)
         elif scales.shape[0] != num_partitions:
             raise ValueError(
@@ -198,7 +262,11 @@ def build_hybrid_replacements_from_calibration(
 
         k = int(module_payload["k"])
         feature_dim = int(module_payload["feature_dim"])
-        if mode == "int4":
+        if mode == "tp_uncompressed":
+            bf16_indices = None
+        elif mode == "all_bf16":
+            bf16_indices = torch.arange(feature_dim, dtype=torch.long)
+        elif mode == "int4":
             bf16_indices = torch.empty(0, dtype=torch.long)
         elif mode == "selected_bf16":
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
@@ -207,23 +275,35 @@ def build_hybrid_replacements_from_calibration(
 
         output_dtype = getattr(getattr(original_module, "weight", None), "dtype", torch.float32)
         if isinstance(original_module, nn.Linear):
-            replacements[module_name] = HybridQuantizedRowParallelLinear.from_linear(
-                original_module,
-                num_partitions=num_partitions,
-                scales_per_partition=scales.to(dtype=output_dtype),
-                bf16_feature_indices=bf16_indices,
-                num_bits=num_bits,
-                output_dtype=output_dtype,
-            )
+            if mode == "tp_uncompressed":
+                replacements[module_name] = RowParallelLinear.from_linear(
+                    original_module,
+                    num_partitions=num_partitions,
+                )
+            else:
+                replacements[module_name] = HybridQuantizedRowParallelLinear.from_linear(
+                    original_module,
+                    num_partitions=num_partitions,
+                    scales_per_partition=scales.to(dtype=output_dtype),
+                    bf16_feature_indices=bf16_indices,
+                    num_bits=num_bits,
+                    output_dtype=output_dtype,
+                )
         elif Conv1D is not None and isinstance(original_module, Conv1D):
-            replacements[module_name] = HybridQuantizedRowParallelConv1D.from_conv1d(
-                original_module,
-                num_partitions=num_partitions,
-                scales_per_partition=scales.to(dtype=output_dtype),
-                bf16_feature_indices=bf16_indices,
-                num_bits=num_bits,
-                output_dtype=output_dtype,
-            )
+            if mode == "tp_uncompressed":
+                replacements[module_name] = RowParallelConv1D.from_conv1d(
+                    original_module,
+                    num_partitions=num_partitions,
+                )
+            else:
+                replacements[module_name] = HybridQuantizedRowParallelConv1D.from_conv1d(
+                    original_module,
+                    num_partitions=num_partitions,
+                    scales_per_partition=scales.to(dtype=output_dtype),
+                    bf16_feature_indices=bf16_indices,
+                    num_bits=num_bits,
+                    output_dtype=output_dtype,
+                )
         else:
             raise TypeError(f"Unsupported module type for replacement: {module_name} ({type(original_module)}).")
     return replacements

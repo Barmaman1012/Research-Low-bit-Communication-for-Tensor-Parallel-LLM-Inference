@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -56,3 +57,39 @@ def test_inspect_calibration_formats_fake_payload() -> None:
     assert "module=layer.down_proj" in output
     assert "selected_fraction=0.250000" in output
     assert "top_selected_indices=[1]" in output
+
+
+def test_eval_lm_harness_table_formatting() -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    rows = [
+        {"mode": "full", "task": "arc_easy", "metric": "acc_norm,none", "value": 0.5},
+        {"mode": "int4", "task": "arc_easy", "metric": "acc_norm,none", "value": 0.4},
+    ]
+
+    table = harness_module.format_results_table(rows)
+    summary = harness_module.format_average_summary(rows)
+
+    assert "mode | task | metric | value" in table
+    assert "full | arc_easy | acc_norm,none | 0.500000" in table
+    assert "mode | avg_primary_score" in summary
+    assert "int4 | 0.400000" in summary
+
+
+def test_eval_lm_harness_json_serialization_helper() -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    torch = __import__("torch")
+    obj = {
+        "dtype": torch.float32,
+        "tensor": torch.tensor([[1.0, 2.0]]),
+        "nested": {"items": [torch.tensor(3.0), "x"]},
+    }
+    try:
+        import numpy as np
+
+        obj["numpy_scalar"] = np.float32(1.25)
+        obj["numpy_array"] = np.array([1, 2, 3])
+    except ImportError:
+        pass
+
+    serializable = harness_module.make_json_serializable(obj)
+    json.dumps(serializable)

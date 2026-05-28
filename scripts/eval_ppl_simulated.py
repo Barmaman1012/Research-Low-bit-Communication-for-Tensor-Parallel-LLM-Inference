@@ -22,7 +22,7 @@ from lowbit_tp_comm.hooks import (
     replace_modules_by_name,
 )
 
-VALID_MODES = {"full", "int4", "random_bf16", "selected_bf16"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verbose_bits", action="store_true")
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
+    parser.add_argument("--num_bits", type=int, default=4)
     return parser.parse_args()
 
 
@@ -95,6 +96,10 @@ def compute_bits_summary(
 ) -> tuple[float, list[dict[str, float | int | str]]]:
     if mode == "full":
         return 16.0, []
+    if mode == "tp_uncompressed":
+        return 16.0, []
+    if mode == "all_bf16":
+        return 16.0, []
     if mode == "int4":
         return float(num_bits), []
     if calibration is None:
@@ -128,6 +133,7 @@ def build_model_for_mode(
     seed: int,
     device: torch.device,
     target_style: str,
+    num_bits: int,
 ) -> tuple[torch.nn.Module, dict[str, Any] | None]:
     try:
         model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -157,6 +163,7 @@ def build_model_for_mode(
             calibration=calibration,
             mode=mode,
             num_partitions=num_partitions,
+            num_bits=num_bits,
             seed=seed,
         )
         replace_modules_by_name(model, replacements)
@@ -178,6 +185,7 @@ def evaluate_mode(
     sequence_length: int,
     verbose_bits: bool,
     target_style: str,
+    num_bits: int,
 ) -> dict[str, float | str]:
     model, calibration = build_model_for_mode(
         model_name=model_name,
@@ -187,8 +195,9 @@ def evaluate_mode(
         seed=seed,
         device=device,
         target_style=target_style,
+        num_bits=num_bits,
     )
-    avg_bits, module_rows = compute_bits_summary(mode, calibration)
+    avg_bits, module_rows = compute_bits_summary(mode, calibration, num_bits=num_bits)
 
     if verbose_bits and module_rows:
         print(f"Bit summary for mode={mode}:")
@@ -286,6 +295,7 @@ def main() -> None:
             sequence_length=args.sequence_length,
             verbose_bits=args.verbose_bits,
             target_style=args.target_style,
+            num_bits=args.num_bits,
         )
         for mode in modes
     ]

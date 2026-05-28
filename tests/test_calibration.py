@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
+from lowbit_tp_comm.tp_linear import compute_row_parallel_partials_for_module
 
 
 def test_first_update_initializes_min_and_max_directly() -> None:
@@ -139,3 +140,15 @@ def test_state_dict_round_trip_restores_calibrator() -> None:
     assert restored.initialized == calibrator.initialized
     assert torch.equal(restored.min_vals, calibrator.min_vals)
     assert torch.equal(restored.max_vals, calibrator.max_vals)
+
+
+def test_simulated_row_parallel_calibration_shapes_match_num_partitions() -> None:
+    linear = torch.nn.Linear(8, 6, bias=False)
+    x = torch.randn(2, 4, 8)
+    partials = compute_row_parallel_partials_for_module(linear, x, num_partitions=2)
+    calibrator = EMAMinMaxCalibrator(num_partitions=2, feature_dim=6)
+
+    calibrator.update(partials)
+
+    assert calibrator.min_vals.shape == (2, 6)
+    assert calibrator.max_vals.shape == (2, 6)

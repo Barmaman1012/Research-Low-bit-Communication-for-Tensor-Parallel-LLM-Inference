@@ -154,8 +154,81 @@ PYTHONPATH=src ./.venv/bin/python scripts/eval_ppl_simulated.py \
   --num_partitions 2
 ```
 
+Calibrate `distilgpt2` with simulated row-parallel calibration:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/calibrate_model.py \
+  --model_name distilgpt2 \
+  --target_style gpt2 \
+  --simulate_row_parallel_calibration \
+  --num_partitions 2 \
+  --num_sequences 128 \
+  --sequence_length 128 \
+  --output_path calibration-distilgpt2-tp2.pt
+```
+
+Inspect:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/inspect_calibration.py \
+  --calibration_path calibration-distilgpt2-tp2.pt
+```
+
+Evaluate:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/eval_ppl_simulated.py \
+  --model_name distilgpt2 \
+  --calibration_path calibration-distilgpt2-tp2.pt \
+  --target_style gpt2 \
+  --modes full,tp_uncompressed,all_bf16,int4,random_bf16,selected_bf16 \
+  --num_sequences 128 \
+  --sequence_length 128 \
+  --num_partitions 2 \
+  --verbose_bits
+```
+
+## Paper-style benchmark evaluation
+
+Install `lm-eval` first:
+
+```bash
+./.venv/bin/pip install lm-eval
+```
+
+Calibrate first with partition-aware calibration, then run a limited debug benchmark:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
+  --model_name distilgpt2 \
+  --calibration_path calibration-distilgpt2-tp2.pt \
+  --target_style gpt2 \
+  --mode selected_bf16 \
+  --tasks arc_easy,boolq \
+  --limit 10 \
+  --batch_size 1
+```
+
+Run all modes on the same debug slice:
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
+  --model_name distilgpt2 \
+  --calibration_path calibration-distilgpt2-tp2.pt \
+  --target_style gpt2 \
+  --modes full,int4,random_bf16,selected_bf16 \
+  --tasks arc_easy,boolq \
+  --limit 10 \
+  --batch_size 1
+```
+
+The original paper evaluates much larger models, including Gemma 2 27B, Llama 2 13B, and Mistral NeMo 12B across 8 devices. This repository remains a smaller single-process simulated reproduction of the communication idea rather than a direct systems-scale reproduction.
+
 ## Notes
 
 - This is still a numerical communication simulation. Int4 values are stored in `torch.int8`; true bandwidth savings would require bit-packing.
 - Calibration collected with `num_partitions=1` is currently repeated across simulated partitions during replacement. Real tensor-parallel calibration would need partition-specific statistics.
 - The Hugging Face and `datasets` stacks may emit a Python 3.12 `resource_tracker` shutdown warning after successful runs. The current scripts still complete and save results correctly.
+- Perplexity on small evaluation slices can behave strangely, especially when the slice is only tens or hundreds of sequences.
+- The paper reports zero-shot task accuracy, not only perplexity, so perplexity alone is not enough to judge whether selected BF16 is working as intended.
+- We should not conclude that `selected_bf16` fails until we run larger evaluations and benchmark tasks.

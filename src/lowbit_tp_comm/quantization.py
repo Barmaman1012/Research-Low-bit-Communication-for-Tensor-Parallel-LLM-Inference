@@ -19,8 +19,13 @@ class QuantizedTensor:
 
 
 def _validate_num_bits(num_bits: int) -> None:
-    if num_bits != 4:
-        raise ValueError(f"Only signed Int4 simulation is supported, got num_bits={num_bits}.")
+    if not 2 <= num_bits <= 8:
+        raise ValueError(f"Only signed low-bit simulation with 2 <= num_bits <= 8 is supported, got {num_bits}.")
+
+
+def get_qmin_qmax(num_bits: int) -> tuple[int, int]:
+    _validate_num_bits(num_bits)
+    return -(2 ** (num_bits - 1)), (2 ** (num_bits - 1)) - 1
 
 
 def get_symmetric_scale(
@@ -39,7 +44,7 @@ def get_symmetric_scale(
     if min_vals.ndim != 1:
         raise ValueError(f"Expected per-feature vectors with shape [E], got ndim={min_vals.ndim}.")
 
-    qmax = (2 ** (num_bits - 1)) - 1
+    _, qmax = get_qmin_qmax(num_bits)
     symmetric_abs = torch.maximum(min_vals.abs(), max_vals.abs())
     return torch.clamp(symmetric_abs / float(qmax), min=eps)
 
@@ -54,9 +59,7 @@ def quantize_symmetric(x: Tensor, scale: Tensor, num_bits: int = 4) -> Tensor:
         into one byte before transport.
     """
 
-    _validate_num_bits(num_bits)
-    qmin = -(2 ** (num_bits - 1))
-    qmax = (2 ** (num_bits - 1)) - 1
+    qmin, qmax = get_qmin_qmax(num_bits)
 
     q = torch.round(x / scale)
     q = torch.clamp(q, min=qmin, max=qmax)
@@ -103,6 +106,69 @@ def hybrid_quant_dequant(
 
     reconstructed[..., indices] = x[..., indices].to(output_dtype)
     return reconstructed
+
+
+def quantization_error_stats(
+    original: Tensor,
+    reconstructed: Tensor,
+    q: Tensor | None = None,
+    qmin: int = -8,
+    qmax: int = 7,
+    selected_indices: Tensor | Sequence[int] | None = None,
+) -> dict[str, float]:
+    """Summarize reconstruction and saturation behavior for quantized tensors."""
+
+    if original.shape != reconstructed.shape:
+        raise ValueError(
+            f"original and reconstructed must have the same shape, got {original.shape} and {reconstructed.shape}."
+        )
+
+    original_fp = original.to(torch.float32)
+    reconstructed_fp = reconstructed.to(torch.float32)
+    error = reconstructed_fp - original_fp
+    abs_error = error.abs()
+    mse = (error ** 2).mean()
+    original_std = float(original_fp.std(unbiased=False).item())
+
+    stats: dict[str, float] = {
+        "mean_abs_error": float(abs_error.mean().item()),
+        "max_abs_error": float(abs_error.max().item()),
+        "rmse": float(torch.sqrt(mse).item()),
+        "mean_signed_error": float(error.mean().item()),
+        "relative_rmse": float(torch.sqrt(mse).item()) / max(original_std, 1e-12),
+    }
+
+    if q is not None:
+        q_fp = q.to(torch.float32)
+        stats["quantized_min"] = float(q_fp.min().item())
+        stats["quantized_max"] = float(q_fp.max().item())
+        stats["saturation_low_rate"] = float((q == qmin).to(torch.float32).mean().item())
+        stats["saturation_high_rate"] = float((q == qmax).to(torch.float32).mean().item())
+
+    if selected_indices is not None:
+        if isinstance(selected_indices, Tensor):
+            indices = selected_indices.to(dtype=torch.long, device=original.device)
+        else:
+            indices = torch.tensor(list(selected_indices), dtype=torch.long, device=original.device)
+
+        feature_dim = original.shape[-1]
+        mask = torch.zeros(feature_dim, dtype=torch.bool, device=original.device)
+        if indices.numel() > 0:
+            mask[indices] = True
+
+        selected_error = abs_error[..., mask]
+        non_selected_error = abs_error[..., ~mask]
+        stats["selected_fraction"] = float(mask.to(torch.float32).mean().item())
+        stats["selected_mean_abs_error"] = float(selected_error.mean().item()) if selected_error.numel() > 0 else 0.0
+        stats["selected_max_abs_error"] = float(selected_error.max().item()) if selected_error.numel() > 0 else 0.0
+        stats["non_selected_mean_abs_error"] = (
+            float(non_selected_error.mean().item()) if non_selected_error.numel() > 0 else 0.0
+        )
+        stats["non_selected_max_abs_error"] = (
+            float(non_selected_error.max().item()) if non_selected_error.numel() > 0 else 0.0
+        )
+
+    return stats
 
 
 class IdentityQuantizer:

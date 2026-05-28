@@ -16,7 +16,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
-from lowbit_tp_comm.hooks import ActivationCapture, list_candidate_sync_modules
+from lowbit_tp_comm.hooks import ActivationCapture, ModuleInputOutputCapture, list_candidate_sync_modules
+from lowbit_tp_comm.tp_linear import compute_row_parallel_partials_for_module
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--patterns", nargs="*", default=None)
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
+    parser.add_argument("--simulate_row_parallel_calibration", action="store_true")
+    parser.add_argument("--num_partitions", type=int, default=2)
     return parser.parse_args()
 
 
@@ -105,7 +108,10 @@ def main() -> None:
     for name in candidate_names:
         print(f"- {name}")
 
-    capture = ActivationCapture(model, candidate_names)
+    if args.simulate_row_parallel_calibration:
+        capture = ModuleInputOutputCapture(model, candidate_names)
+    else:
+        capture = ActivationCapture(model, candidate_names)
     calibrators: dict[str, EMAMinMaxCalibrator] = {}
 
     try:
@@ -117,17 +123,36 @@ def main() -> None:
                 model(**encoded)
 
                 for module_name in candidate_names:
-                    outputs = capture.get_outputs(module_name)
-                    for output_tensor in outputs:
-                        feature_dim = output_tensor.shape[-1]
-                        if module_name not in calibrators:
-                            calibrators[module_name] = EMAMinMaxCalibrator(
-                                num_partitions=1,
-                                feature_dim=feature_dim,
-                                gamma=args.gamma,
-                                device="cpu",
+                    if args.simulate_row_parallel_calibration:
+                        module = dict(candidate_modules)[module_name]
+                        input_tensors = capture.get_inputs(module_name)
+                        for input_tensor in input_tensors:
+                            partial_outputs = compute_row_parallel_partials_for_module(
+                                module,
+                                input_tensor,
+                                num_partitions=args.num_partitions,
                             )
-                        calibrators[module_name].update([output_tensor])
+                            feature_dim = partial_outputs[0].shape[-1]
+                            if module_name not in calibrators:
+                                calibrators[module_name] = EMAMinMaxCalibrator(
+                                    num_partitions=args.num_partitions,
+                                    feature_dim=feature_dim,
+                                    gamma=args.gamma,
+                                    device="cpu",
+                                )
+                            calibrators[module_name].update(partial_outputs)
+                    else:
+                        outputs = capture.get_outputs(module_name)
+                        for output_tensor in outputs:
+                            feature_dim = output_tensor.shape[-1]
+                            if module_name not in calibrators:
+                                calibrators[module_name] = EMAMinMaxCalibrator(
+                                    num_partitions=1,
+                                    feature_dim=feature_dim,
+                                    gamma=args.gamma,
+                                    device="cpu",
+                                )
+                            calibrators[module_name].update([output_tensor])
 
                 if index % 8 == 0 or index == len(texts):
                     print(f"Processed {index}/{len(texts)} sequences")
@@ -165,6 +190,8 @@ def main() -> None:
         "k_fraction": args.k_fraction,
         "num_sequences": args.num_sequences,
         "sequence_length": args.sequence_length,
+        "simulated_row_parallel_calibration": args.simulate_row_parallel_calibration,
+        "num_partitions": args.num_partitions if args.simulate_row_parallel_calibration else 1,
         "modules": module_payload,
     }
     torch.save(payload, args.output_path)

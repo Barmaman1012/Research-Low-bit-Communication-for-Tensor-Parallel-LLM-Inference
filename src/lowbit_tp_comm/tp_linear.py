@@ -59,6 +59,60 @@ def make_random_bf16_indices(
     return torch.randperm(feature_dim, generator=generator)[:clamped_k].to(device=device)
 
 
+def compute_row_parallel_partials_for_module(
+    module: nn.Module,
+    x: Tensor,
+    num_partitions: int,
+) -> list[Tensor]:
+    """Compute row-parallel partial outputs for supported projection modules.
+
+    Bias is intentionally excluded. The returned partials sum to the pre-bias
+    projection output.
+    """
+
+    if num_partitions <= 0:
+        raise ValueError(f"num_partitions must be positive, got {num_partitions}.")
+
+    if isinstance(module, nn.Linear):
+        in_features = module.in_features
+        out_features = module.out_features
+        if x.shape[-1] != in_features:
+            raise ValueError(f"Expected input trailing dimension {in_features}, got {x.shape[-1]}.")
+        if in_features % num_partitions != 0:
+            raise ValueError(
+                f"Input dimension {in_features} must be divisible by num_partitions={num_partitions}."
+            )
+        partition_size = in_features // num_partitions
+        x_parts = list(x.split(partition_size, dim=-1))
+        weight_parts = list(module.weight.split(partition_size, dim=1))
+        partials = [
+            torch.matmul(x_i, w_i.transpose(0, 1))
+            for x_i, w_i in zip(x_parts, weight_parts, strict=True)
+        ]
+    elif Conv1D is not None and isinstance(module, Conv1D):
+        in_features, out_features = module.weight.shape
+        if x.shape[-1] != in_features:
+            raise ValueError(f"Expected input trailing dimension {in_features}, got {x.shape[-1]}.")
+        if in_features % num_partitions != 0:
+            raise ValueError(
+                f"Input dimension {in_features} must be divisible by num_partitions={num_partitions}."
+            )
+        partition_size = in_features // num_partitions
+        x_parts = list(x.split(partition_size, dim=-1))
+        weight_parts = list(module.weight.split(partition_size, dim=0))
+        partials = [torch.matmul(x_i, w_i) for x_i, w_i in zip(x_parts, weight_parts, strict=True)]
+    else:
+        raise TypeError(f"Unsupported module type for row-parallel partials: {type(module)}")
+
+    expected_shape = (*x.shape[:-1], out_features)
+    for partial in partials:
+        if tuple(partial.shape) != expected_shape:
+            raise ValueError(
+                f"Expected partial output shape {expected_shape}, got {tuple(partial.shape)}."
+            )
+    return partials
+
+
 class TensorParallelLinearSimulator:
     """Single-process simulation of input-sharded tensor parallel linear layers.
 
@@ -201,6 +255,110 @@ class _HybridQuantizedRowParallelBase(nn.Module):
                 f"Expected input trailing dimension {self.in_features}, got {x.shape[-1]}."
             )
         return list(x.split(self.partition_size, dim=-1))
+
+
+class _RowParallelBase(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_features: int,
+        out_features: int,
+        bias: Tensor | None,
+        num_partitions: int,
+    ) -> None:
+        super().__init__()
+        if num_partitions <= 0:
+            raise ValueError(f"num_partitions must be positive, got {num_partitions}.")
+        if in_features % num_partitions != 0:
+            raise ValueError(
+                f"Input dimension {in_features} must be divisible by num_partitions={num_partitions}."
+            )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_partitions = num_partitions
+        self.partition_size = in_features // num_partitions
+        if bias is None:
+            self.bias = None
+        else:
+            self.bias = nn.Parameter(bias.detach().clone(), requires_grad=False)
+
+    def _split_input(self, x: Tensor) -> list[Tensor]:
+        if x.shape[-1] != self.in_features:
+            raise ValueError(
+                f"Expected input trailing dimension {self.in_features}, got {x.shape[-1]}."
+            )
+        return list(x.split(self.partition_size, dim=-1))
+
+
+class RowParallelLinear(_RowParallelBase):
+    """Exact single-process row-parallel replacement for nn.Linear."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        num_partitions: int,
+    ) -> None:
+        if weight.ndim != 2:
+            raise ValueError(f"weight must have shape [out_features, in_features], got {tuple(weight.shape)}.")
+        out_features, in_features = weight.shape
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            num_partitions=num_partitions,
+        )
+        self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
+        self.weight_partitions = list(self.weight.split(self.partition_size, dim=1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_partitions = self._split_input(x)
+        partials = [
+            torch.matmul(x_i, weight_i.transpose(0, 1))
+            for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)
+        ]
+        y = torch.stack(partials, dim=0).sum(dim=0)
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, num_partitions: int) -> "RowParallelLinear":
+        return cls(weight=linear.weight, bias=linear.bias, num_partitions=num_partitions)
+
+
+class RowParallelConv1D(_RowParallelBase):
+    """Exact single-process row-parallel replacement for GPT-2 style Conv1D."""
+
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        num_partitions: int,
+    ) -> None:
+        if weight.ndim != 2:
+            raise ValueError(f"weight must have shape [in_features, out_features], got {tuple(weight.shape)}.")
+        in_features, out_features = weight.shape
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            num_partitions=num_partitions,
+        )
+        self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
+        self.weight_partitions = list(self.weight.split(self.partition_size, dim=0))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_partitions = self._split_input(x)
+        partials = [torch.matmul(x_i, weight_i) for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)]
+        y = torch.stack(partials, dim=0).sum(dim=0)
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+    @classmethod
+    def from_conv1d(cls, conv1d: Conv1D, num_partitions: int) -> "RowParallelConv1D":
+        return cls(weight=conv1d.weight, bias=conv1d.bias, num_partitions=num_partitions)
 
 
 class HybridQuantizedRowParallelLinear(_HybridQuantizedRowParallelBase):

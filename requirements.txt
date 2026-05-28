@@ -3,3 +3,5 @@ transformers>=4.40
 datasets>=2.18
 accelerate>=0.29
 pytest>=8.0
+# Optional benchmark evaluation:
+# lm-eval

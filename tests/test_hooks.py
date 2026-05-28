@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from lowbit_tp_comm.hooks import ActivationCapture, list_candidate_sync_modules
+from lowbit_tp_comm.hooks import ActivationCapture, ModuleInputOutputCapture, list_candidate_sync_modules
 
 
 class TinyModel(nn.Module):
@@ -114,3 +114,17 @@ def test_activation_capture_remove_disables_future_capture() -> None:
     model(torch.randn(2, 4))
 
     assert capture.get_outputs("down_proj") == []
+
+
+def test_module_input_output_capture_captures_inputs_and_outputs() -> None:
+    model = TinyModel()
+    capture = ModuleInputOutputCapture(model, ["down_proj"])
+    x = torch.randn(2, 4)
+
+    model(x)
+
+    assert len(capture.get_inputs("down_proj")) == 1
+    assert len(capture.get_outputs("down_proj")) == 1
+    assert capture.get_inputs("down_proj")[0].shape == (2, 4)
+    assert capture.get_outputs("down_proj")[0].shape == (2, 4)
+    capture.remove()
