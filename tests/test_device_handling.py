@@ -20,11 +20,25 @@ class DummyTokenizer:
         }
 
 
+class MetadataTokenizer(DummyTokenizer):
+    def __call__(self, texts, **kwargs):
+        encoded = super().__call__(texts, **kwargs)
+        encoded["metadata"] = "preserve-me"
+        return encoded
+
+
 def test_calibration_build_inputs_moves_every_tensor_to_cpu() -> None:
     encoded = build_inputs(DummyTokenizer(), ["test"], sequence_length=4, device=torch.device("cpu"))
 
     assert encoded
     assert all(tensor.device.type == "cpu" for tensor in encoded.values())
+
+
+def test_calibration_build_inputs_preserves_non_tensor_values() -> None:
+    encoded = build_inputs(MetadataTokenizer(), ["test"], sequence_length=4, device=torch.device("cpu"))
+
+    assert encoded["metadata"] == "preserve-me"
+    assert encoded["input_ids"].device.type == "cpu"
 
 
 def test_captured_cpu_inputs_match_cpu_module_weights_for_partials() -> None:
@@ -43,7 +57,9 @@ def test_captured_cpu_inputs_match_cpu_module_weights_for_partials() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_calibration_inputs_and_captured_partials_stay_on_cuda() -> None:
-    device = torch.device("cuda")
+    # Tensor.device is concrete (cuda:0), while torch.device("cuda") is not
+    # equal to torch.device("cuda:0") despite selecting the same default GPU.
+    device = torch.device("cuda:0")
     encoded = build_inputs(DummyTokenizer(), ["test"], sequence_length=4, device=device)
     module = nn.Linear(8, 6, bias=False).to(device)
     capture = ModuleInputOutputCapture(module, [""], store_on_cpu=False)

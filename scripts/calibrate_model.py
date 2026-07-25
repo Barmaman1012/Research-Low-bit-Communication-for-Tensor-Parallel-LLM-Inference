@@ -4,6 +4,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -57,7 +58,7 @@ def build_inputs(
     texts: list[str],
     sequence_length: int,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Any]:
     """Tokenize text and place every model input on the execution device."""
 
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
@@ -68,7 +69,13 @@ def build_inputs(
         truncation=True,
         max_length=sequence_length,
     )
-    return {key: value.to(device) for key, value in encoded.items()}
+    # Tokenizers normally return BatchEncoding, but tests and downstream
+    # callers may provide a plain mapping.  Move tensor values explicitly so
+    # both forms work while retaining any non-tensor metadata unchanged.
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in encoded.items()
+    }
 
 
 def load_text_dataset(dataset_name: str, dataset_config: str, split: str):
