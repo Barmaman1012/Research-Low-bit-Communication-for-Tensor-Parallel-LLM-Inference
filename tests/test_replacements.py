@@ -77,6 +77,17 @@ def test_tp_uncompressed_linear_matches_original_linear() -> None:
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_row_parallel_linear_derives_partitions_from_current_weight_dtype() -> None:
+    linear = nn.Linear(8, 6)
+    module = RowParallelLinear.from_linear(linear, num_partitions=2)
+    linear.double()
+    module.double()
+    x = torch.randn(4, 8, dtype=torch.float64)
+
+    assert not hasattr(module, "weight_partitions")
+    assert torch.allclose(module(x), linear(x), atol=1e-12, rtol=1e-12)
+
+
 def test_all_selected_bf16_matches_original_linear() -> None:
     linear = nn.Linear(8, 6)
     scales = torch.ones(2, 6, dtype=linear.weight.dtype)
@@ -127,6 +138,69 @@ def test_tp_uncompressed_conv1d_matches_original_conv1d() -> None:
     actual = module(x)
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(Conv1D is None, reason="transformers Conv1D is not importable")
+def test_row_parallel_conv1d_derives_partitions_from_current_weight_dtype() -> None:
+    conv = Conv1D(6, 8)
+    module = RowParallelConv1D.from_conv1d(conv, num_partitions=2)
+    conv.double()
+    module.double()
+    x = torch.randn(2, 4, 8, dtype=torch.float64)
+
+    assert not hasattr(module, "weight_partitions")
+    assert torch.allclose(module(x), conv(x), atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or Conv1D is None, reason="CUDA or transformers Conv1D is unavailable")
+def test_replacements_created_on_cpu_work_after_cuda_move() -> None:
+    device = torch.device("cuda:0")
+    linear = nn.Linear(8, 6)
+    conv = Conv1D(6, 8)
+    linear_input = torch.randn(3, 8, device=device)
+    conv_input = torch.randn(2, 4, 8, device=device)
+    linear_scales = torch.ones(2, 6)
+    conv_scales = torch.ones(2, 6)
+    selected = torch.arange(6, dtype=torch.long)
+
+    replacements = [
+        (RowParallelLinear.from_linear(linear, num_partitions=2), linear, linear_input),
+        (
+            HybridQuantizedRowParallelLinear.from_linear(
+                linear,
+                num_partitions=2,
+                scales_per_partition=linear_scales,
+                bf16_feature_indices=selected,
+                output_dtype=linear.weight.dtype,
+            ),
+            linear,
+            linear_input,
+        ),
+        (RowParallelConv1D.from_conv1d(conv, num_partitions=2), conv, conv_input),
+        (
+            HybridQuantizedRowParallelConv1D.from_conv1d(
+                conv,
+                num_partitions=2,
+                scales_per_partition=conv_scales,
+                bf16_feature_indices=selected,
+                output_dtype=conv.weight.dtype,
+            ),
+            conv,
+            conv_input,
+        ),
+    ]
+
+    for replacement, original, inputs in replacements:
+        replacement.to(device)
+        original.to(device)
+        actual = replacement(inputs)
+        expected = original(inputs)
+
+        assert not hasattr(replacement, "weight_partitions")
+        assert actual.device == device
+        assert all(parameter.device == device for parameter in replacement.parameters())
+        assert all(buffer.device == device for buffer in replacement.buffers())
+        assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_build_hybrid_replacements_from_fake_calibration() -> None:

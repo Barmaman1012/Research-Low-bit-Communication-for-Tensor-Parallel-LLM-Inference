@@ -308,13 +308,13 @@ class RowParallelLinear(_RowParallelBase):
             num_partitions=num_partitions,
         )
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
-        self.weight_partitions = list(self.weight.split(self.partition_size, dim=1))
 
     def forward(self, x: Tensor) -> Tensor:
         x_partitions = self._split_input(x)
+        weight_partitions = self.weight.split(self.partition_size, dim=1)
         partials = [
             torch.matmul(x_i, weight_i.transpose(0, 1))
-            for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)
+            for x_i, weight_i in zip(x_partitions, weight_partitions, strict=True)
         ]
         y = torch.stack(partials, dim=0).sum(dim=0)
         if self.bias is not None:
@@ -345,11 +345,11 @@ class RowParallelConv1D(_RowParallelBase):
             num_partitions=num_partitions,
         )
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
-        self.weight_partitions = list(self.weight.split(self.partition_size, dim=0))
 
     def forward(self, x: Tensor) -> Tensor:
         x_partitions = self._split_input(x)
-        partials = [torch.matmul(x_i, weight_i) for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)]
+        weight_partitions = self.weight.split(self.partition_size, dim=0)
+        partials = [torch.matmul(x_i, weight_i) for x_i, weight_i in zip(x_partitions, weight_partitions, strict=True)]
         y = torch.stack(partials, dim=0).sum(dim=0)
         if self.bias is not None:
             y = y + self.bias
@@ -387,13 +387,13 @@ class HybridQuantizedRowParallelLinear(_HybridQuantizedRowParallelBase):
             output_dtype=output_dtype,
         )
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
-        self.weight_partitions = list(self.weight.split(self.partition_size, dim=1))
 
     def forward(self, x: Tensor) -> Tensor:
         x_partitions = self._split_input(x)
+        weight_partitions = self.weight.split(self.partition_size, dim=1)
         partials = [
             torch.matmul(x_i, weight_i.transpose(0, 1))
-            for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)
+            for x_i, weight_i in zip(x_partitions, weight_partitions, strict=True)
         ]
         reconstructed = [
             hybrid_quant_dequant(
@@ -458,11 +458,11 @@ class HybridQuantizedRowParallelConv1D(_HybridQuantizedRowParallelBase):
             output_dtype=output_dtype,
         )
         self.weight = nn.Parameter(weight.detach().clone(), requires_grad=False)
-        self.weight_partitions = list(self.weight.split(self.partition_size, dim=0))
 
     def forward(self, x: Tensor) -> Tensor:
         x_partitions = self._split_input(x)
-        partials = [torch.matmul(x_i, weight_i) for x_i, weight_i in zip(x_partitions, self.weight_partitions, strict=True)]
+        weight_partitions = self.weight.split(self.partition_size, dim=0)
+        partials = [torch.matmul(x_i, weight_i) for x_i, weight_i in zip(x_partitions, weight_partitions, strict=True)]
         reconstructed = [
             hybrid_quant_dequant(
                 partial,
