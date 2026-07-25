@@ -6,7 +6,6 @@ from typing import Any, Sequence
 import torch
 from torch import Tensor
 
-
 @dataclass(slots=True)
 class QuantizedTensor:
     """Container for simulated quantized communication payloads."""
@@ -35,6 +34,7 @@ def get_symmetric_scale(
     eps: float = 1e-8,
 ) -> Tensor:
     """Compute per-feature symmetric scales for signed Int4 quantization."""
+
 
     _validate_num_bits(num_bits)
     if min_vals.shape != max_vals.shape:
