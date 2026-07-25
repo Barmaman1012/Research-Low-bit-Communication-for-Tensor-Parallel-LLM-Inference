@@ -134,10 +134,23 @@ class ActivationCapture:
 
 
 class ModuleInputOutputCapture:
-    """Capture module inputs via pre-hooks and outputs via forward hooks."""
+    """Capture module inputs via pre-hooks and outputs via forward hooks.
 
-    def __init__(self, model: nn.Module, module_names: Sequence[str]) -> None:
+    By default captured tensors are copied to CPU for inexpensive storage.  Set
+    ``store_on_cpu=False`` when a caller needs to reuse a captured tensor with
+    the module that produced it (for example, simulated row-parallel partial
+    computation on a CUDA model).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        module_names: Sequence[str],
+        *,
+        store_on_cpu: bool = True,
+    ) -> None:
         self.module_names = list(module_names)
+        self.store_on_cpu = store_on_cpu
         self.inputs: dict[str, list[Tensor]] = defaultdict(list)
         self.outputs: dict[str, list[Tensor]] = defaultdict(list)
         self._handles: list[RemovableHandle] = []
@@ -162,7 +175,8 @@ class ModuleInputOutputCapture:
             tensor = inputs[0]
             if not isinstance(tensor, torch.Tensor):
                 return
-            self.inputs[module_name].append(tensor.detach().cpu())
+            captured = tensor.detach()
+            self.inputs[module_name].append(captured.cpu() if self.store_on_cpu else captured)
 
         return hook
 
@@ -171,7 +185,8 @@ class ModuleInputOutputCapture:
             tensor = output[0] if isinstance(output, tuple) else output
             if not isinstance(tensor, torch.Tensor):
                 return
-            self.outputs[module_name].append(tensor.detach().cpu())
+            captured = tensor.detach()
+            self.outputs[module_name].append(captured.cpu() if self.store_on_cpu else captured)
 
         return hook
 
@@ -274,6 +289,7 @@ def build_hybrid_replacements_from_calibration(
             bf16_indices = make_random_bf16_indices(feature_dim, k, seed=seed)
 
         output_dtype = getattr(getattr(original_module, "weight", None), "dtype", torch.float32)
+        module_device = getattr(getattr(original_module, "weight", None), "device", torch.device("cpu"))
         if isinstance(original_module, nn.Linear):
             if mode == "tp_uncompressed":
                 replacements[module_name] = RowParallelLinear.from_linear(
@@ -284,8 +300,8 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = HybridQuantizedRowParallelLinear.from_linear(
                     original_module,
                     num_partitions=num_partitions,
-                    scales_per_partition=scales.to(dtype=output_dtype),
-                    bf16_feature_indices=bf16_indices,
+                    scales_per_partition=scales.to(device=module_device, dtype=output_dtype),
+                    bf16_feature_indices=bf16_indices.to(device=module_device),
                     num_bits=num_bits,
                     output_dtype=output_dtype,
                 )
@@ -299,8 +315,8 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = HybridQuantizedRowParallelConv1D.from_conv1d(
                     original_module,
                     num_partitions=num_partitions,
-                    scales_per_partition=scales.to(dtype=output_dtype),
-                    bf16_feature_indices=bf16_indices,
+                    scales_per_partition=scales.to(device=module_device, dtype=output_dtype),
+                    bf16_feature_indices=bf16_indices.to(device=module_device),
                     num_bits=num_bits,
                     output_dtype=output_dtype,
                 )

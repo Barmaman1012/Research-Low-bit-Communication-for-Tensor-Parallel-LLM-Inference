@@ -197,6 +197,7 @@ def evaluate_mode(
         target_style=target_style,
         num_bits=num_bits,
     )
+    model_device = next(model.parameters()).device
     avg_bits, module_rows = compute_bits_summary(mode, calibration, num_bits=num_bits)
 
     if verbose_bits and module_rows:
@@ -217,7 +218,7 @@ def evaluate_mode(
                 truncation=True,
                 max_length=sequence_length,
             )
-            encoded = {key: value.to(device) for key, value in encoded.items()}
+            encoded = {key: value.to(model_device) for key, value in encoded.items()}
             outputs = model(**encoded, labels=encoded["input_ids"])
             losses.append(float(outputs.loss.item()))
             if index % 8 == 0 or index == len(texts):

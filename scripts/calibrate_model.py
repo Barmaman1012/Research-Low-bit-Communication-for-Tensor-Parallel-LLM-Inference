@@ -52,7 +52,14 @@ def select_nonempty_texts(dataset, num_sequences: int) -> list[str]:
     return selected
 
 
-def build_inputs(tokenizer, texts: list[str], sequence_length: int) -> dict[str, torch.Tensor]:
+def build_inputs(
+    tokenizer,
+    texts: list[str],
+    sequence_length: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Tokenize text and place every model input on the execution device."""
+
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
     encoded = tokenizer(
         texts,
@@ -61,7 +68,7 @@ def build_inputs(tokenizer, texts: list[str], sequence_length: int) -> dict[str,
         truncation=True,
         max_length=sequence_length,
     )
-    return dict(encoded)
+    return {key: value.to(device) for key, value in encoded.items()}
 
 
 def load_text_dataset(dataset_name: str, dataset_config: str, split: str):
@@ -91,6 +98,7 @@ def main() -> None:
         raise
     model.eval()
     model.to(device)
+    model_device = next(model.parameters()).device
 
     dataset = load_text_dataset(args.dataset_name, args.dataset_config, split=args.split)
     texts = select_nonempty_texts(dataset, args.num_sequences)
@@ -109,7 +117,9 @@ def main() -> None:
         print(f"- {name}")
 
     if args.simulate_row_parallel_calibration:
-        capture = ModuleInputOutputCapture(model, candidate_names)
+        # These inputs are reused with the target module's weights below, so
+        # they must remain on the model's execution device.
+        capture = ModuleInputOutputCapture(model, candidate_names, store_on_cpu=False)
     else:
         capture = ActivationCapture(model, candidate_names)
     calibrators: dict[str, EMAMinMaxCalibrator] = {}
@@ -118,8 +128,7 @@ def main() -> None:
         with torch.no_grad():
             for index, text in enumerate(texts, start=1):
                 capture.clear()
-                encoded = build_inputs(tokenizer, [text], args.sequence_length)
-                encoded = {key: value.to(device) for key, value in encoded.items()}
+                encoded = build_inputs(tokenizer, [text], args.sequence_length, model_device)
                 model(**encoded)
 
                 for module_name in candidate_names:

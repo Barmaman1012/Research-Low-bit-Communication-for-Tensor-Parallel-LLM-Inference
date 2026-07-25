@@ -126,6 +126,10 @@ def build_model_for_mode(
             seed=seed,
         )
         replace_modules_by_name(model, replacements)
+        # Replacements include calibration buffers loaded from CPU.  Move the
+        # complete model again so all replacement parameters and buffers match
+        # the requested execution device before lm-eval invokes it.
+        model.to(device)
     return model, calibration
 
 
