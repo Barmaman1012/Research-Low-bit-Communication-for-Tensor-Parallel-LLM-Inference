@@ -222,6 +222,11 @@ PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
   --batch_size 1
 ```
 
+`eval_lm_harness.py` applies replacements using the exact module names stored
+in the calibration artifact. Its `--target_style` option is retained as
+calibration provenance in result metadata; it does not retarget modules during
+evaluation.
+
 The original paper evaluates much larger models, including Gemma 2 27B, Llama 2 13B, and Mistral NeMo 12B across 8 devices. This repository remains a smaller single-process simulated reproduction of the communication idea rather than a direct systems-scale reproduction.
 
 ## Notes

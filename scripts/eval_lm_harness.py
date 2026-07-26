@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import platform
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -22,6 +27,11 @@ if str(SRC) not in sys.path:
 
 from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, replace_modules_by_name
 
+try:
+    from transformers.pytorch_utils import Conv1D
+except ImportError:  # pragma: no cover
+    Conv1D = None
+
 VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16"}
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"]
 
@@ -30,7 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate simulated TP modes with lm-eval-harness.")
     parser.add_argument("--model_name", default="distilgpt2")
     parser.add_argument("--calibration_path", default=None)
-    parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="gpt2")
+    parser.add_argument(
+        "--target_style",
+        choices=["auto", "gpt2", "llama"],
+        default="gpt2",
+        help="Calibration provenance only; evaluation uses exact module names stored in the artifact.",
+    )
     parser.add_argument("--mode", choices=sorted(VALID_MODES), default="full")
     parser.add_argument("--modes", default=None)
     parser.add_argument("--num_partitions", type=int, default=2)
@@ -100,11 +115,88 @@ def load_tokenizer_or_raise(model_name: str):
     return tokenizer
 
 
+def _module_feature_dim(module: nn.Module) -> int:
+    if isinstance(module, nn.Linear):
+        return module.out_features
+    if Conv1D is not None and isinstance(module, Conv1D):
+        return int(module.weight.shape[1])
+    raise TypeError(f"Unsupported calibrated module type: {type(module)}")
+
+
+def validate_calibration_compatibility(
+    model: nn.Module,
+    calibration: dict[str, Any],
+    *,
+    model_name: str,
+    num_partitions: int,
+) -> None:
+    """Reject calibration artifacts that do not match the evaluation model."""
+
+    recorded_model_name = calibration.get("model_name")
+    if recorded_model_name and recorded_model_name != model_name:
+        raise ValueError(
+            "Calibration model_name mismatch: artifact was created for "
+            f"{recorded_model_name!r}, but evaluation requested {model_name!r}."
+        )
+
+    modules = calibration.get("modules")
+    if not isinstance(modules, dict) or not modules:
+        raise ValueError("Calibration artifact must contain a non-empty 'modules' mapping.")
+
+    artifact_partitions = calibration.get("num_partitions")
+    partition_specific = bool(calibration.get("simulated_row_parallel_calibration", False))
+    if partition_specific and artifact_partitions != num_partitions:
+        raise ValueError(
+            "Calibration partition mismatch: artifact contains partition-specific statistics for "
+            f"num_partitions={artifact_partitions}, but evaluation requested num_partitions={num_partitions}."
+        )
+    expected_partition_count = num_partitions if partition_specific else 1
+    named_modules = dict(model.named_modules())
+    for module_name, payload in modules.items():
+        if module_name not in named_modules:
+            raise ValueError(f"Calibrated module {module_name!r} is not present in the evaluation model.")
+        if not isinstance(payload, dict) or "state_dict" not in payload:
+            raise ValueError(f"Calibration entry for {module_name!r} is missing state_dict.")
+        state = payload["state_dict"]
+        if not isinstance(state, dict):
+            raise ValueError(f"Calibration state_dict for {module_name!r} must be a mapping.")
+        min_vals = state.get("min_vals")
+        max_vals = state.get("max_vals")
+        if not isinstance(min_vals, torch.Tensor) or not isinstance(max_vals, torch.Tensor):
+            raise ValueError(f"Calibration state for {module_name!r} must contain tensor min_vals and max_vals.")
+        if min_vals.ndim != 2 or max_vals.shape != min_vals.shape:
+            raise ValueError(f"Calibration scale statistics for {module_name!r} must have matching [P, E] shapes.")
+        if min_vals.shape[0] != expected_partition_count:
+            raise ValueError(
+                f"Calibration partition scales for {module_name!r} have P={min_vals.shape[0]}, "
+                f"expected P={expected_partition_count}."
+            )
+        state_partitions = state.get("num_partitions")
+        if state_partitions != expected_partition_count:
+            raise ValueError(
+                f"Calibration state for {module_name!r} records num_partitions={state_partitions}, "
+                f"expected {expected_partition_count}."
+            )
+        model_feature_dim = _module_feature_dim(named_modules[module_name])
+        artifact_feature_dim = payload.get("feature_dim")
+        state_feature_dim = state.get("feature_dim")
+        if artifact_feature_dim != model_feature_dim or state_feature_dim != model_feature_dim:
+            raise ValueError(
+                f"Calibration feature dimension mismatch for {module_name!r}: artifact has "
+                f"feature_dim={artifact_feature_dim} (state={state_feature_dim}), "
+                f"but model requires {model_feature_dim}."
+            )
+        if min_vals.shape[1] != model_feature_dim:
+            raise ValueError(
+                f"Calibration scale shape mismatch for {module_name!r}: got E={min_vals.shape[1]}, "
+                f"but model requires E={model_feature_dim}."
+            )
+
+
 def build_model_for_mode(
     *,
     model_name: str,
     calibration_path: str | None,
-    target_style: str,
     mode: str,
     num_partitions: int,
     num_bits: int,
@@ -117,6 +209,12 @@ def build_model_for_mode(
         if calibration_path is None:
             raise ValueError("--calibration_path is required for non-full modes.")
         calibration = torch.load(calibration_path, map_location="cpu", weights_only=False)
+        validate_calibration_compatibility(
+            model,
+            calibration,
+            model_name=model_name,
+            num_partitions=num_partitions,
+        )
         replacements = build_hybrid_replacements_from_calibration(
             model,
             calibration=calibration,
@@ -133,11 +231,87 @@ def build_model_for_mode(
     return model, calibration
 
 
+def build_simple_evaluate_kwargs(
+    simple_evaluate,
+    *,
+    model: Any,
+    tasks: list[str],
+    limit: int | None,
+    batch_size: str,
+    device: torch.device,
+    seed: int,
+) -> dict[str, Any]:
+    """Build lm-eval arguments using only parameters its installed API exposes."""
+
+    supported = inspect.signature(simple_evaluate).parameters
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "tasks": tasks,
+        "limit": limit,
+        "batch_size": batch_size,
+        "device": str(device),
+    }
+    requested_optional = {
+        "num_fewshot": 0,
+        "random_seed": seed,
+        "numpy_random_seed": seed,
+        "torch_random_seed": seed,
+        "fewshot_random_seed": seed,
+    }
+    kwargs.update({name: value for name, value in requested_optional.items() if name in supported})
+    return kwargs
+
+
+def _git_commit_hash() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def build_run_metadata(
+    *,
+    args: argparse.Namespace,
+    model: nn.Module,
+    tokenizer: Any,
+    lm_eval: Any,
+    tasks: list[str],
+    modes: list[str],
+) -> dict[str, Any]:
+    parameter = next(model.parameters(), None)
+    return {
+        "model_name": args.model_name,
+        "tokenizer_name": getattr(tokenizer, "name_or_path", None),
+        "requested_device": args.device,
+        "actual_model_device": str(parameter.device) if parameter is not None else None,
+        "model_parameter_dtype": str(parameter.dtype) if parameter is not None else None,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "lm_eval_version": getattr(lm_eval, "__version__", None),
+        "python_version": platform.python_version(),
+        "tasks": tasks,
+        "num_fewshot": 0,
+        "limit": args.limit,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "mode": args.mode,
+        "modes": modes,
+        "num_partitions": args.num_partitions,
+        "num_bits": args.num_bits,
+        "calibration_path": args.calibration_path,
+        "target_style": args.target_style,
+        "git_commit": _git_commit_hash(),
+    }
+
+
 def extract_rows(mode: str, results: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for task_name, metrics in results.get("results", {}).items():
         for metric_name, value in metrics.items():
-            if metric_name.endswith(",stderr"):
+            metric_base = metric_name.split(",", maxsplit=1)[0]
+            if metric_base.endswith("_stderr") or metric_base in {"sample_len", "num_samples", "num_fewshot"}:
                 continue
             try:
                 numeric_value = float(value)
@@ -168,8 +342,6 @@ def primary_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             picked = next((row for row in task_rows if row["metric"] == metric_name), None)
             if picked is not None:
                 break
-        if picked is None and task_rows:
-            picked = task_rows[0]
         if picked is not None:
             selected.append(picked)
     return selected
@@ -224,11 +396,11 @@ def main() -> None:
 
     all_rows: list[dict[str, Any]] = []
     raw_results: dict[str, Any] = {}
+    metadata_by_mode: dict[str, dict[str, Any]] = {}
     for mode in modes:
         model, _calibration = build_model_for_mode(
             model_name=args.model_name,
             calibration_path=args.calibration_path,
-            target_style=args.target_style,
             mode=mode,
             num_partitions=args.num_partitions,
             num_bits=args.num_bits,
@@ -239,23 +411,37 @@ def main() -> None:
             pretrained=model,
             tokenizer=tokenizer,
             batch_size=args.batch_size,
-            device=str(device),
+            device=str(next(model.parameters()).device),
         )
         results = lm_eval.simple_evaluate(
-            model=lm,
-            tasks=tasks,
-            limit=args.limit,
-            batch_size=args.batch_size,
-            device=str(device),
+            **build_simple_evaluate_kwargs(
+                lm_eval.simple_evaluate,
+                model=lm,
+                tasks=tasks,
+                limit=args.limit,
+                batch_size=args.batch_size,
+                device=next(model.parameters()).device,
+                seed=args.seed,
+            )
         )
         raw_results[mode] = results
+        metadata_by_mode[mode] = build_run_metadata(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            lm_eval=lm_eval,
+            tasks=tasks,
+            modes=modes,
+        )
         all_rows.extend(extract_rows(mode, results))
 
     print(format_results_table(all_rows))
     print(format_average_summary(all_rows))
 
     if args.output_path is not None:
-        payload = make_json_serializable({"rows": all_rows, "raw_results": raw_results})
+        payload = make_json_serializable(
+            {"metadata": metadata_by_mode, "rows": all_rows, "raw_results": raw_results}
+        )
         with open(args.output_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
         print(f"\nSaved results to {args.output_path}")
