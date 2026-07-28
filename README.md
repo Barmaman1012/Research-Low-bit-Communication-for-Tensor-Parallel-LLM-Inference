@@ -167,6 +167,48 @@ PYTHONPATH=src ./.venv/bin/python scripts/calibrate_model.py \
   --output_path calibration-distilgpt2-tp2.pt
 ```
 
+## Explicit execution dtype
+
+`calibrate_model.py`, `eval_ppl_simulated.py`, and `eval_lm_harness.py` all
+accept `--dtype auto|float32|float16|bfloat16`. Explicit values are passed to
+the installed Transformers API through its supported `dtype` loading argument;
+they are not implemented by loading FP32 then silently treating it as BF16.
+
+For BF16 runs, model parameters, target-module inputs/partials, preserved
+selected communication values, Int4-dequantized values, and replacement
+outputs are BF16. Calibration EMA min/max values and Int4 scales intentionally
+remain FP32 for numerical stability, but are computed from BF16 partials.
+The calibration artifact records both facts and evaluation rejects an explicit
+dtype mismatch. Analytical selected-feature bit reports use 16 bits only for a
+BF16/FP16 path; FP32 selected values are reported as 32-bit values.
+
+CUDA BF16 requests fail clearly on GPUs without native BF16 support rather than
+falling back to FP32. CPU dtype-routing tests remain supported.
+
+Empire AI smoke calibration (adjust the model name and output path as needed):
+
+```bash
+PYTHONPATH=src python scripts/calibrate_model.py \
+  --model_name google/gemma-2-27b \
+  --target_style llama \
+  --dtype bfloat16 --device cuda --num_partitions 8 \
+  --simulate_row_parallel_calibration \
+  --num_sequences 8 --sequence_length 128 \
+  --output_path calibration-gemma2-27b-tp8-bf16.pt
+```
+
+Empire AI smoke evaluation:
+
+```bash
+PYTHONPATH=src python scripts/eval_lm_harness.py \
+  --model_name google/gemma-2-27b \
+  --calibration_path calibration-gemma2-27b-tp8-bf16.pt \
+  --target_style llama --mode selected_bf16 \
+  --dtype bfloat16 --device cuda --num_partitions 8 \
+  --tasks arc_easy --limit 10 --batch_size 1 \
+  --output_path results-gemma2-27b-tp8-bf16-smoke.json
+```
+
 Inspect:
 
 ```bash

@@ -255,6 +255,13 @@ class _HybridQuantizedRowParallelBase(nn.Module):
             )
         return list(x.split(self.partition_size, dim=-1))
 
+    def _validate_output_dtype(self, output: Tensor) -> Tensor:
+        if output.dtype != self.output_dtype:
+            raise RuntimeError(
+                f"Hybrid TP replacement produced {output.dtype}, expected model-compatible {self.output_dtype}."
+            )
+        return output
+
 
 class _RowParallelBase(nn.Module):
     def __init__(
@@ -408,7 +415,7 @@ class HybridQuantizedRowParallelLinear(_HybridQuantizedRowParallelBase):
         y = torch.stack(reconstructed, dim=0).sum(dim=0)
         if self.bias is not None:
             y = y + self.bias.to(self.output_dtype)
-        return y
+        return self._validate_output_dtype(y)
 
     @classmethod
     def from_linear(
@@ -476,7 +483,7 @@ class HybridQuantizedRowParallelConv1D(_HybridQuantizedRowParallelBase):
         y = torch.stack(reconstructed, dim=0).sum(dim=0)
         if self.bias is not None:
             y = y + self.bias.to(self.output_dtype)
-        return y
+        return self._validate_output_dtype(y)
 
     @classmethod
     def from_conv1d(

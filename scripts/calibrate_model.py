@@ -17,6 +17,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
+from lowbit_tp_comm.dtypes import (
+    DTYPE_CHOICES,
+    ensure_dtype_supported,
+    model_dtype_metadata,
+    model_load_kwargs,
+    resolve_dtype,
+    validate_model_dtype,
+)
 from lowbit_tp_comm.hooks import ActivationCapture, ModuleInputOutputCapture, list_candidate_sync_modules
 from lowbit_tp_comm.tp_linear import compute_row_parallel_partials_for_module
 
@@ -33,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k_fraction", type=float, default=0.015625)
     parser.add_argument("--output_path", default="calibration.pt")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=DTYPE_CHOICES, default="auto")
     parser.add_argument("--patterns", nargs="*", default=None)
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
     parser.add_argument("--simulate_row_parallel_calibration", action="store_true")
@@ -89,13 +98,40 @@ def load_text_dataset(dataset_name: str, dataset_config: str, split: str):
         return load_dataset(fallback_name, dataset_config, split=split)
 
 
+def build_dtype_metadata(
+    *,
+    requested_dtype_name: str,
+    model: torch.nn.Module,
+    calibrators: dict[str, EMAMinMaxCalibrator],
+    observed_partial_dtypes: set[str],
+) -> dict[str, Any]:
+    """Describe execution dtype separately from intentionally FP32 statistics."""
+
+    requested_dtype = resolve_dtype(requested_dtype_name)
+    model_dtype = next(model.parameters()).dtype
+    return {
+        "requested_model_dtype": requested_dtype_name,
+        **model_dtype_metadata(model),
+        "partial_output_dtype": (
+            next(iter(observed_partial_dtypes)) if len(observed_partial_dtypes) == 1 else sorted(observed_partial_dtypes)
+        ),
+        "calibration_statistics_dtype": str(next(iter(calibrators.values())).min_vals.dtype)
+        if calibrators
+        else str(torch.float32),
+        "intended_selected_feature_communication_dtype": str(requested_dtype or model_dtype),
+        "intended_reconstructed_output_dtype": str(requested_dtype or model_dtype),
+    }
+
+
 def main() -> None:
     args = parse_args()
 
     device = torch.device(args.device)
+    requested_dtype = resolve_dtype(args.dtype)
+    ensure_dtype_supported(requested_dtype, device)
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs(args.dtype))
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -105,6 +141,7 @@ def main() -> None:
         raise
     model.eval()
     model.to(device)
+    validate_model_dtype(model, requested_dtype)
     model_device = next(model.parameters()).device
 
     dataset = load_text_dataset(args.dataset_name, args.dataset_config, split=args.split)
@@ -130,6 +167,7 @@ def main() -> None:
     else:
         capture = ActivationCapture(model, candidate_names)
     calibrators: dict[str, EMAMinMaxCalibrator] = {}
+    observed_partial_dtypes: set[str] = set()
 
     try:
         with torch.no_grad():
@@ -148,6 +186,7 @@ def main() -> None:
                                 input_tensor,
                                 num_partitions=args.num_partitions,
                             )
+                            observed_partial_dtypes.update(str(partial.dtype) for partial in partial_outputs)
                             feature_dim = partial_outputs[0].shape[-1]
                             if module_name not in calibrators:
                                 calibrators[module_name] = EMAMinMaxCalibrator(
@@ -160,6 +199,7 @@ def main() -> None:
                     else:
                         outputs = capture.get_outputs(module_name)
                         for output_tensor in outputs:
+                            observed_partial_dtypes.add(str(output_tensor.dtype))
                             feature_dim = output_tensor.shape[-1]
                             if module_name not in calibrators:
                                 calibrators[module_name] = EMAMinMaxCalibrator(
@@ -208,6 +248,14 @@ def main() -> None:
         "sequence_length": args.sequence_length,
         "simulated_row_parallel_calibration": args.simulate_row_parallel_calibration,
         "num_partitions": args.num_partitions if args.simulate_row_parallel_calibration else 1,
+        # Min/max EMA and derived scales are FP32 for stable calibration, but
+        # their inputs above are partial outputs from the requested model dtype.
+        "dtype_metadata": build_dtype_metadata(
+            requested_dtype_name=args.dtype,
+            model=model,
+            calibrators=calibrators,
+            observed_partial_dtypes=observed_partial_dtypes,
+        ),
         "modules": module_payload,
     }
     torch.save(payload, args.output_path)

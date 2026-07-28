@@ -300,7 +300,10 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = HybridQuantizedRowParallelLinear.from_linear(
                     original_module,
                     num_partitions=num_partitions,
-                    scales_per_partition=scales.to(device=module_device, dtype=output_dtype),
+                    # Calibration statistics/scales intentionally remain FP32.
+                    # They were accumulated from model-dtype partials, while
+                    # Int4 reconstruction and selected values use output_dtype.
+                    scales_per_partition=scales.to(device=module_device, dtype=torch.float32),
                     bf16_feature_indices=bf16_indices.to(device=module_device),
                     num_bits=num_bits,
                     output_dtype=output_dtype,
@@ -315,7 +318,7 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = HybridQuantizedRowParallelConv1D.from_conv1d(
                     original_module,
                     num_partitions=num_partitions,
-                    scales_per_partition=scales.to(device=module_device, dtype=output_dtype),
+                    scales_per_partition=scales.to(device=module_device, dtype=torch.float32),
                     bf16_feature_indices=bf16_indices.to(device=module_device),
                     num_bits=num_bits,
                     output_dtype=output_dtype,

@@ -21,6 +21,14 @@ from lowbit_tp_comm.hooks import (
     list_candidate_sync_modules,
     replace_modules_by_name,
 )
+from lowbit_tp_comm.dtypes import (
+    DTYPE_CHOICES,
+    ensure_dtype_supported,
+    model_load_kwargs,
+    resolve_dtype,
+    validate_model_dtype,
+    validate_module_devices_and_dtypes,
+)
 
 VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16"}
 
@@ -35,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_sequences", type=int, default=32)
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=DTYPE_CHOICES, default="auto")
     parser.add_argument("--num_partitions", type=int, default=2)
     parser.add_argument("--mode", choices=sorted(VALID_MODES), default="full")
     parser.add_argument("--modes", default=None)
@@ -82,24 +91,33 @@ def parse_modes(mode: str, modes: str | None) -> list[str]:
     return parsed
 
 
-def compute_module_avg_bits(feature_dim: int, k: int, num_bits: int = 4) -> float:
+def dtype_bits(dtype: torch.dtype) -> int:
+    if dtype in {torch.float16, torch.bfloat16}:
+        return 16
+    if dtype is torch.float32:
+        return 32
+    raise ValueError(f"Unsupported communication dtype for analytical bit reporting: {dtype}.")
+
+
+def compute_module_avg_bits(feature_dim: int, k: int, num_bits: int = 4, selected_bits: int = 16) -> float:
     if feature_dim <= 0:
         raise ValueError(f"feature_dim must be positive, got {feature_dim}.")
     selected_fraction = min(max(k, 0), feature_dim) / feature_dim
-    return selected_fraction * 16.0 + (1.0 - selected_fraction) * float(num_bits)
+    return selected_fraction * float(selected_bits) + (1.0 - selected_fraction) * float(num_bits)
 
 
 def compute_bits_summary(
     mode: str,
     calibration: dict[str, Any] | None,
     num_bits: int = 4,
+    selected_feature_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[float, list[dict[str, float | int | str]]]:
     if mode == "full":
         return 16.0, []
     if mode == "tp_uncompressed":
         return 16.0, []
     if mode == "all_bf16":
-        return 16.0, []
+        return float(dtype_bits(selected_feature_dtype)), []
     if mode == "int4":
         return float(num_bits), []
     if calibration is None:
@@ -110,7 +128,9 @@ def compute_bits_summary(
         feature_dim = int(module_payload["feature_dim"])
         k = int(module_payload["k"])
         selected_fraction = k / feature_dim if feature_dim > 0 else 0.0
-        avg_bits = compute_module_avg_bits(feature_dim, k, num_bits=num_bits)
+        avg_bits = compute_module_avg_bits(
+            feature_dim, k, num_bits=num_bits, selected_bits=dtype_bits(selected_feature_dtype)
+        )
         module_rows.append(
             {
                 "module_name": module_name,
@@ -134,9 +154,12 @@ def build_model_for_mode(
     device: torch.device,
     target_style: str,
     num_bits: int,
+    dtype_name: str = "auto",
 ) -> tuple[torch.nn.Module, dict[str, Any] | None]:
+    requested_dtype = resolve_dtype(dtype_name)
+    ensure_dtype_supported(requested_dtype, device)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs(dtype_name))
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -145,10 +168,12 @@ def build_model_for_mode(
         )
         raise
     model.eval()
+    validate_model_dtype(model, requested_dtype)
 
     calibration = None
     if mode != "full":
         calibration = torch.load(calibration_path, map_location="cpu", weights_only=False)
+        validate_calibration_dtype(calibration, dtype_name)
         candidate_names = {
             name for name, _module in list_candidate_sync_modules(model, target_style=target_style)
         }
@@ -169,7 +194,21 @@ def build_model_for_mode(
         replace_modules_by_name(model, replacements)
 
     model.to(device)
+    validate_module_devices_and_dtypes(model, device, requested_dtype)
     return model, calibration
+
+
+def validate_calibration_dtype(calibration: dict[str, Any], dtype_name: str) -> None:
+    """Require explicit evaluation precision to match explicit calibration."""
+
+    if dtype_name == "auto":
+        return
+    metadata = calibration.get("dtype_metadata", {})
+    recorded = metadata.get("requested_model_dtype") if isinstance(metadata, dict) else None
+    if recorded is not None and recorded != dtype_name:
+        raise ValueError(
+            f"Calibration dtype mismatch: artifact requested {recorded!r}, evaluation requested {dtype_name!r}."
+        )
 
 
 def evaluate_mode(
@@ -186,6 +225,7 @@ def evaluate_mode(
     verbose_bits: bool,
     target_style: str,
     num_bits: int,
+    dtype_name: str = "auto",
 ) -> dict[str, float | str]:
     model, calibration = build_model_for_mode(
         model_name=model_name,
@@ -196,9 +236,13 @@ def evaluate_mode(
         device=device,
         target_style=target_style,
         num_bits=num_bits,
+        dtype_name=dtype_name,
     )
     model_device = next(model.parameters()).device
-    avg_bits, module_rows = compute_bits_summary(mode, calibration, num_bits=num_bits)
+    model_dtype = next(model.parameters()).dtype
+    avg_bits, module_rows = compute_bits_summary(
+        mode, calibration, num_bits=num_bits, selected_feature_dtype=model_dtype
+    )
 
     if verbose_bits and module_rows:
         print(f"Bit summary for mode={mode}:")
@@ -231,6 +275,7 @@ def evaluate_mode(
         "avg_loss": avg_loss,
         "perplexity": perplexity,
         "avg_bits_per_value": avg_bits,
+        "actual_model_dtype": str(model_dtype),
     }
 
 
@@ -297,6 +342,7 @@ def main() -> None:
             verbose_bits=args.verbose_bits,
             target_style=args.target_style,
             num_bits=args.num_bits,
+            dtype_name=args.dtype,
         )
         for mode in modes
     ]

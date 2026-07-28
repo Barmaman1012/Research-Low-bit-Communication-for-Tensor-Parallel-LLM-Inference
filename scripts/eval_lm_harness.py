@@ -26,6 +26,15 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, replace_modules_by_name
+from lowbit_tp_comm.dtypes import (
+    DTYPE_CHOICES,
+    ensure_dtype_supported,
+    model_dtype_metadata,
+    model_load_kwargs,
+    resolve_dtype,
+    validate_model_dtype,
+    validate_module_devices_and_dtypes,
+)
 
 try:
     from transformers.pytorch_utils import Conv1D
@@ -53,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=DTYPE_CHOICES, default="auto")
     parser.add_argument("--batch_size", default="1")
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -86,9 +96,11 @@ def safe_import_lm_eval():
     return lm_eval, HFLM
 
 
-def load_model_or_raise(model_name: str, device: torch.device):
+def load_model_or_raise(model_name: str, device: torch.device, dtype_name: str = "auto"):
+    requested_dtype = resolve_dtype(dtype_name)
+    ensure_dtype_supported(requested_dtype, device)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs(dtype_name))
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -98,6 +110,7 @@ def load_model_or_raise(model_name: str, device: torch.device):
         raise
     model.eval()
     model.to(device)
+    validate_model_dtype(model, requested_dtype)
     return model
 
 
@@ -129,6 +142,7 @@ def validate_calibration_compatibility(
     *,
     model_name: str,
     num_partitions: int,
+    dtype_name: str = "auto",
 ) -> None:
     """Reject calibration artifacts that do not match the evaluation model."""
 
@@ -138,6 +152,13 @@ def validate_calibration_compatibility(
             "Calibration model_name mismatch: artifact was created for "
             f"{recorded_model_name!r}, but evaluation requested {model_name!r}."
         )
+    if dtype_name != "auto":
+        dtype_metadata = calibration.get("dtype_metadata", {})
+        recorded_dtype = dtype_metadata.get("requested_model_dtype") if isinstance(dtype_metadata, dict) else None
+        if recorded_dtype is not None and recorded_dtype != dtype_name:
+            raise ValueError(
+                f"Calibration dtype mismatch: artifact requested {recorded_dtype!r}, evaluation requested {dtype_name!r}."
+            )
 
     modules = calibration.get("modules")
     if not isinstance(modules, dict) or not modules:
@@ -202,8 +223,9 @@ def build_model_for_mode(
     num_bits: int,
     device: torch.device,
     seed: int,
+    dtype_name: str = "auto",
 ):
-    model = load_model_or_raise(model_name, device)
+    model = load_model_or_raise(model_name, device, dtype_name)
     calibration = None
     if mode != "full":
         if calibration_path is None:
@@ -214,6 +236,7 @@ def build_model_for_mode(
             calibration,
             model_name=model_name,
             num_partitions=num_partitions,
+            dtype_name=dtype_name,
         )
         replacements = build_hybrid_replacements_from_calibration(
             model,
@@ -228,6 +251,7 @@ def build_model_for_mode(
         # complete model again so all replacement parameters and buffers match
         # the requested execution device before lm-eval invokes it.
         model.to(device)
+    validate_module_devices_and_dtypes(model, device, resolve_dtype(dtype_name))
     return model, calibration
 
 
@@ -280,13 +304,11 @@ def build_run_metadata(
     tasks: list[str],
     modes: list[str],
 ) -> dict[str, Any]:
-    parameter = next(model.parameters(), None)
-    return {
+    metadata = {
         "model_name": args.model_name,
         "tokenizer_name": getattr(tokenizer, "name_or_path", None),
         "requested_device": args.device,
-        "actual_model_device": str(parameter.device) if parameter is not None else None,
-        "model_parameter_dtype": str(parameter.dtype) if parameter is not None else None,
+        "requested_model_dtype": getattr(args, "dtype", "auto"),
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
         "lm_eval_version": getattr(lm_eval, "__version__", None),
@@ -304,6 +326,17 @@ def build_run_metadata(
         "target_style": args.target_style,
         "git_commit": _git_commit_hash(),
     }
+    metadata.update(model_dtype_metadata(model))
+    replacement_metadata: dict[str, Any] = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "output_dtype") and hasattr(module, "scales_per_partition"):
+            replacement_metadata[name] = {
+                "reconstructed_output_dtype": str(module.output_dtype),
+                "scale_dtype": str(module.scales_per_partition.dtype),
+                "selected_feature_communication_dtype": str(module.output_dtype),
+            }
+    metadata["replacement_dtypes"] = replacement_metadata
+    return metadata
 
 
 def extract_rows(mode: str, results: dict[str, Any]) -> list[dict[str, Any]]:
@@ -406,6 +439,7 @@ def main() -> None:
             num_bits=args.num_bits,
             device=device,
             seed=args.seed,
+            dtype_name=args.dtype,
         )
         lm = HFLM(
             pretrained=model,
