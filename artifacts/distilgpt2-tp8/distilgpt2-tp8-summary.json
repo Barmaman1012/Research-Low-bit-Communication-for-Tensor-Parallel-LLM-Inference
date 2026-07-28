@@ -1,0 +1,304 @@
+{
+  "scores": [
+    {
+      "mode": "full",
+      "task": "arc_challenge",
+      "metric": "acc_norm,none",
+      "score": 0.2295221843003413
+    },
+    {
+      "mode": "full",
+      "task": "arc_easy",
+      "metric": "acc_norm,none",
+      "score": 0.36574074074074076
+    },
+    {
+      "mode": "full",
+      "task": "boolq",
+      "metric": "acc,none",
+      "score": 0.5883792048929664
+    },
+    {
+      "mode": "full",
+      "task": "hellaswag",
+      "metric": "acc_norm,none",
+      "score": 0.27504481179047996
+    },
+    {
+      "mode": "full",
+      "task": "winogrande",
+      "metric": "acc,none",
+      "score": 0.5035516969218626
+    },
+    {
+      "mode": "int4",
+      "task": "arc_challenge",
+      "metric": "acc_norm,none",
+      "score": 0.22866894197952217
+    },
+    {
+      "mode": "int4",
+      "task": "arc_easy",
+      "metric": "acc_norm,none",
+      "score": 0.3581649831649832
+    },
+    {
+      "mode": "int4",
+      "task": "boolq",
+      "metric": "acc,none",
+      "score": 0.5923547400611621
+    },
+    {
+      "mode": "int4",
+      "task": "hellaswag",
+      "metric": "acc_norm,none",
+      "score": 0.27912766381198967
+    },
+    {
+      "mode": "int4",
+      "task": "winogrande",
+      "metric": "acc,none",
+      "score": 0.4988161010260458
+    },
+    {
+      "mode": "random_bf16",
+      "task": "arc_challenge",
+      "metric": "acc_norm,none",
+      "score": 0.22610921501706485
+    },
+    {
+      "mode": "random_bf16",
+      "task": "arc_easy",
+      "metric": "acc_norm,none",
+      "score": 0.3560606060606061
+    },
+    {
+      "mode": "random_bf16",
+      "task": "boolq",
+      "metric": "acc,none",
+      "score": 0.5902140672782875
+    },
+    {
+      "mode": "random_bf16",
+      "task": "hellaswag",
+      "metric": "acc_norm,none",
+      "score": 0.2787293367855009
+    },
+    {
+      "mode": "random_bf16",
+      "task": "winogrande",
+      "metric": "acc,none",
+      "score": 0.4972375690607735
+    },
+    {
+      "mode": "selected_bf16",
+      "task": "arc_challenge",
+      "metric": "acc_norm,none",
+      "score": 0.2354948805460751
+    },
+    {
+      "mode": "selected_bf16",
+      "task": "arc_easy",
+      "metric": "acc_norm,none",
+      "score": 0.35185185185185186
+    },
+    {
+      "mode": "selected_bf16",
+      "task": "boolq",
+      "metric": "acc,none",
+      "score": 0.600611620795107
+    },
+    {
+      "mode": "selected_bf16",
+      "task": "hellaswag",
+      "metric": "acc_norm,none",
+      "score": 0.277733519219279
+    },
+    {
+      "mode": "selected_bf16",
+      "task": "winogrande",
+      "metric": "acc,none",
+      "score": 0.5027624309392266
+    }
+  ],
+  "summary": [
+    {
+      "mode": "full",
+      "bits_per_value": 16.0,
+      "arc_easy": 0.36574074074074076,
+      "arc_challenge": 0.2295221843003413,
+      "winogrande": 0.5035516969218626,
+      "hellaswag": 0.27504481179047996,
+      "boolq": 0.5883792048929664,
+      "average": 0.3924477277292782,
+      "performance_retained_percent": 100.0
+    },
+    {
+      "mode": "int4",
+      "bits_per_value": 4.0,
+      "arc_easy": 0.3581649831649832,
+      "arc_challenge": 0.22866894197952217,
+      "winogrande": 0.4988161010260458,
+      "hellaswag": 0.27912766381198967,
+      "boolq": 0.5923547400611621,
+      "average": 0.3914264860087406,
+      "performance_retained_percent": 99.7397763706146
+    },
+    {
+      "mode": "random_bf16",
+      "bits_per_value": 4.1875,
+      "arc_easy": 0.3560606060606061,
+      "arc_challenge": 0.22610921501706485,
+      "winogrande": 0.4972375690607735,
+      "hellaswag": 0.2787293367855009,
+      "boolq": 0.5902140672782875,
+      "average": 0.3896701588404466,
+      "performance_retained_percent": 99.29224487936196
+    },
+    {
+      "mode": "selected_bf16",
+      "bits_per_value": 4.1875,
+      "arc_easy": 0.35185185185185186,
+      "arc_challenge": 0.2354948805460751,
+      "winogrande": 0.5027624309392266,
+      "hellaswag": 0.277733519219279,
+      "boolq": 0.600611620795107,
+      "average": 0.39369086067030795,
+      "performance_retained_percent": 100.31676395432905
+    }
+  ],
+  "metadata_by_mode": {
+    "full": {
+      "full": {
+        "model_name": "distilgpt2",
+        "tokenizer_name": "distilgpt2",
+        "requested_device": "cuda",
+        "actual_model_device": "cuda:0",
+        "model_parameter_dtype": "torch.float32",
+        "torch_version": "2.11.0+cu128",
+        "transformers_version": "5.13.1",
+        "lm_eval_version": "0.4.12",
+        "python_version": "3.12.13",
+        "tasks": [
+          "arc_easy",
+          "arc_challenge",
+          "winogrande",
+          "hellaswag",
+          "boolq"
+        ],
+        "num_fewshot": 0,
+        "limit": null,
+        "batch_size": "1",
+        "seed": 0,
+        "mode": "full",
+        "modes": [
+          "full"
+        ],
+        "num_partitions": 8,
+        "num_bits": 4,
+        "calibration_path": "/content/drive/MyDrive/lowbit_tp_results/calibration-distilgpt2-tp8-256.pt",
+        "target_style": "gpt2",
+        "git_commit": "8f7713f425c55b5f0a150aff8715afc8013b369c"
+      }
+    },
+    "int4": {
+      "int4": {
+        "model_name": "distilgpt2",
+        "tokenizer_name": "distilgpt2",
+        "requested_device": "cuda",
+        "actual_model_device": "cuda:0",
+        "model_parameter_dtype": "torch.float32",
+        "torch_version": "2.11.0+cu128",
+        "transformers_version": "5.13.1",
+        "lm_eval_version": "0.4.12",
+        "python_version": "3.12.13",
+        "tasks": [
+          "arc_easy",
+          "arc_challenge",
+          "winogrande",
+          "hellaswag",
+          "boolq"
+        ],
+        "num_fewshot": 0,
+        "limit": null,
+        "batch_size": "1",
+        "seed": 0,
+        "mode": "int4",
+        "modes": [
+          "int4"
+        ],
+        "num_partitions": 8,
+        "num_bits": 4,
+        "calibration_path": "/content/drive/MyDrive/lowbit_tp_results/calibration-distilgpt2-tp8-256.pt",
+        "target_style": "gpt2",
+        "git_commit": "8f7713f425c55b5f0a150aff8715afc8013b369c"
+      }
+    },
+    "random_bf16": {
+      "random_bf16": {
+        "model_name": "distilgpt2",
+        "tokenizer_name": "distilgpt2",
+        "requested_device": "cuda",
+        "actual_model_device": "cuda:0",
+        "model_parameter_dtype": "torch.float32",
+        "torch_version": "2.11.0+cu128",
+        "transformers_version": "5.13.1",
+        "lm_eval_version": "0.4.12",
+        "python_version": "3.12.13",
+        "tasks": [
+          "arc_easy",
+          "arc_challenge",
+          "winogrande",
+          "hellaswag",
+          "boolq"
+        ],
+        "num_fewshot": 0,
+        "limit": null,
+        "batch_size": "1",
+        "seed": 0,
+        "mode": "random_bf16",
+        "modes": [
+          "random_bf16"
+        ],
+        "num_partitions": 8,
+        "num_bits": 4,
+        "calibration_path": "/content/drive/MyDrive/lowbit_tp_results/calibration-distilgpt2-tp8-256.pt",
+        "target_style": "gpt2",
+        "git_commit": "8f7713f425c55b5f0a150aff8715afc8013b369c"
+      }
+    },
+    "selected_bf16": {
+      "selected_bf16": {
+        "model_name": "distilgpt2",
+        "tokenizer_name": "distilgpt2",
+        "requested_device": "cuda",
+        "actual_model_device": "cuda:0",
+        "model_parameter_dtype": "torch.float32",
+        "torch_version": "2.11.0+cu128",
+        "transformers_version": "5.13.1",
+        "lm_eval_version": "0.4.12",
+        "python_version": "3.12.13",
+        "tasks": [
+          "arc_easy",
+          "arc_challenge",
+          "winogrande",
+          "hellaswag",
+          "boolq"
+        ],
+        "num_fewshot": 0,
+        "limit": null,
+        "batch_size": "1",
+        "seed": 0,
+        "mode": "selected_bf16",
+        "modes": [
+          "selected_bf16"
+        ],
+        "num_partitions": 8,
+        "num_bits": 4,
+        "calibration_path": "/content/drive/MyDrive/lowbit_tp_results/calibration-distilgpt2-tp8-256.pt",
+        "target_style": "gpt2",
+        "git_commit": "8f7713f425c55b5f0a150aff8715afc8013b369c"
+      }
+    }
+  }
+}
