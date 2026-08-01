@@ -91,16 +91,32 @@ def validate_model_dtype(model: nn.Module, requested_dtype: torch.dtype | None) 
         )
 
 
+def canonicalize_device(device: torch.device | str) -> torch.device:
+    """Resolve an implicit CUDA device to the current concrete CUDA device.
+
+    ``torch.device("cuda")`` selects the current CUDA device operationally, but
+    tensor devices record that selection as an explicit index (for example,
+    ``cuda:0``).  Canonicalizing only the expected device lets validation
+    compare those equivalent selections without moving model state.
+    """
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 def validate_module_devices_and_dtypes(model: nn.Module, device: torch.device, expected_dtype: torch.dtype | None) -> None:
     """Check replacement/model state before inference; FP32 scales are allowed."""
 
+    expected_device = canonicalize_device(device)
     for name, parameter in model.named_parameters():
-        if parameter.device != device:
-            raise ValueError(f"Parameter {name!r} is on {parameter.device}, expected {device}.")
+        if parameter.device != expected_device:
+            raise ValueError(f"Parameter {name!r} is on {parameter.device}, expected {expected_device}.")
         if expected_dtype is not None and parameter.is_floating_point() and parameter.dtype != expected_dtype:
             raise ValueError(
                 f"Parameter {name!r} has dtype {parameter.dtype}, expected {expected_dtype}."
             )
     for name, buffer in model.named_buffers():
-        if buffer.device != device:
-            raise ValueError(f"Buffer {name!r} is on {buffer.device}, expected {device}.")
+        if buffer.device != expected_device:
+            raise ValueError(f"Buffer {name!r} is on {buffer.device}, expected {expected_device}.")

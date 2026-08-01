@@ -13,7 +13,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from lowbit_tp_comm.dtypes import model_load_kwargs, resolve_dtype, validate_model_dtype
+from lowbit_tp_comm.dtypes import (
+    canonicalize_device,
+    model_load_kwargs,
+    resolve_dtype,
+    validate_model_dtype,
+    validate_module_devices_and_dtypes,
+)
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
 from lowbit_tp_comm.quantization import hybrid_quant_dequant
 from lowbit_tp_comm.tp_linear import HybridQuantizedRowParallelLinear, compute_row_parallel_partials_for_module
@@ -63,6 +69,47 @@ def test_bfloat16_partials_selected_features_and_reconstruction_stay_bfloat16() 
 def test_explicit_dtype_validation_rejects_silent_fp32_model() -> None:
     with pytest.raises(ValueError, match="Requested model dtype"):
         validate_model_dtype(nn.Linear(2, 2), torch.bfloat16)
+
+
+def test_module_device_validation_accepts_cpu_model() -> None:
+    validate_module_devices_and_dtypes(nn.Linear(2, 2), torch.device("cpu"), torch.float32)
+
+
+def test_module_device_validation_rejects_actual_device_mismatch() -> None:
+    model = nn.Linear(2, 2, device="meta")
+
+    with pytest.raises(ValueError, match=r"is on meta, expected cpu"):
+        validate_module_devices_and_dtypes(model, torch.device("cpu"), None)
+
+
+def test_explicit_cuda_index_is_not_rewritten() -> None:
+    assert canonicalize_device(torch.device("cuda:1")) == torch.device("cuda:1")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_module_device_validation_accepts_implicit_current_cuda_device() -> None:
+    with torch.cuda.device(0):
+        model = nn.Linear(2, 2).to(torch.device("cuda:0"))
+
+        validate_module_devices_and_dtypes(model, torch.device("cuda"), torch.float32)
+        assert next(model.parameters()).device == torch.device("cuda:0")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_module_device_validation_accepts_explicit_cuda_zero() -> None:
+    model = nn.Linear(2, 2).to(torch.device("cuda:0"))
+
+    validate_module_devices_and_dtypes(model, torch.device("cuda:0"), torch.float32)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="At least two CUDA devices are required",
+)
+def test_module_device_validation_preserves_explicit_nondefault_cuda_device() -> None:
+    model = nn.Linear(2, 2).to(torch.device("cuda:1"))
+
+    validate_module_devices_and_dtypes(model, torch.device("cuda:1"), torch.float32)
 
 
 def test_calibration_evaluation_dtype_mismatch_is_rejected() -> None:
