@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
 import sys
 from pathlib import Path
@@ -17,6 +18,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
+from lowbit_tp_comm.calibration_data import VALID_SAMPLING_STRATEGIES, prepare_calibration_data
+from lowbit_tp_comm.dtypes import DTYPE_CHOICES, ensure_dtype_supported, model_load_kwargs, resolve_dtype, validate_model_dtype, validate_module_devices_and_dtypes
 from lowbit_tp_comm.hooks import ModuleInputOutputCapture, list_candidate_sync_modules
 from lowbit_tp_comm.quantization import (
     dequantize_symmetric,
@@ -40,18 +43,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_modules", type=int, default=12)
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dtype", choices=DTYPE_CHOICES, default="auto")
+    parser.add_argument("--sampling_strategy", choices=VALID_SAMPLING_STRATEGIES, default="random_token_chunks")
+    parser.add_argument("--dataset_revision", default=None)
+    parser.add_argument("--model_revision", default=None)
+    parser.add_argument("--tokenizer_revision", default=None)
+    parser.add_argument("--output_path", default=None)
+    parser.add_argument("--exclude_calibration_chunks", action="store_true")
     return parser.parse_args()
 
 
-def load_text_dataset(dataset_name: str, dataset_config: str, split: str):
+def load_text_dataset(dataset_name: str, dataset_config: str, split: str, revision: str | None = None):
     try:
-        return load_dataset(dataset_name, dataset_config, split=split)
+        return load_dataset(dataset_name, dataset_config, split=split, revision=revision)
     except HfUriError:
         if "/" in dataset_name:
             raise
         fallback_name = f"Salesforce/{dataset_name}"
         print(f"Retrying dataset load with namespaced path: {fallback_name}")
-        return load_dataset(fallback_name, dataset_config, split=split)
+        return load_dataset(fallback_name, dataset_config, split=split, revision=revision)
 
 
 def select_nonempty_texts(dataset, num_sequences: int) -> list[str]:
@@ -82,17 +92,36 @@ def flatten_records(records: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(flattened, dim=0) if flattened else torch.empty(0, dtype=torch.float32)
 
 
+def int4_payload_saturation_rates(q: torch.Tensor, selected_indices: torch.Tensor, qmin: int, qmax: int) -> dict[str, float]:
+    """Measure saturation only for values actually transmitted as Int4."""
+
+    mask = torch.ones(q.shape[-1], dtype=torch.bool, device=q.device)
+    if selected_indices.numel():
+        mask[selected_indices.to(device=q.device, dtype=torch.long)] = False
+    payload = q[..., mask]
+    if payload.numel() == 0:
+        return {"int4_payload_saturation_low_rate": 0.0, "int4_payload_saturation_high_rate": 0.0}
+    return {
+        "int4_payload_saturation_low_rate": float((payload == qmin).float().mean().item()),
+        "int4_payload_saturation_high_rate": float((payload == qmax).float().mean().item()),
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    requested_dtype = resolve_dtype(args.dtype)
+    ensure_dtype_supported(requested_dtype, device)
     qmin, qmax = get_qmin_qmax(args.num_bits)
 
     calibration = torch.load(args.calibration_path, map_location="cpu", weights_only=False)
     module_payloads = list(calibration["modules"].items())[: args.top_modules]
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        tokenizer_kwargs = {"revision": args.tokenizer_revision} if args.tokenizer_revision is not None else {}
+        model_kwargs = {"revision": args.model_revision} if args.model_revision is not None else {}
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, **tokenizer_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs, **model_load_kwargs(args.dtype))
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -103,14 +132,20 @@ def main() -> None:
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
     model.eval()
     model.to(device)
+    validate_model_dtype(model, requested_dtype)
+    validate_module_devices_and_dtypes(model, device, requested_dtype)
 
     candidate_names = [name for name, _module in list_candidate_sync_modules(model, target_style=args.target_style)]
     module_names = [name for name, _payload in module_payloads if name in candidate_names]
-    capture = ModuleInputOutputCapture(model, module_names)
+    capture = ModuleInputOutputCapture(model, module_names, store_on_cpu=device.type != "cuda")
     module_lookup = dict(model.named_modules())
 
-    dataset = load_text_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    texts = select_nonempty_texts(dataset, args.num_sequences)
+    dataset = load_text_dataset("wikitext", "wikitext-2-raw-v1", split="test", revision=args.dataset_revision)
+    calibration_ids = calibration.get("selected_chunk_ids", []) if args.exclude_calibration_chunks else []
+    prepared_data = prepare_calibration_data(
+        dataset, tokenizer, num_sequences=args.num_sequences, sequence_length=args.sequence_length,
+        sampling_strategy=args.sampling_strategy, seed=args.seed, excluded_chunk_ids=set(calibration_ids),
+    )
 
     diagnostics: dict[str, dict[int, dict[str, list[torch.Tensor]]]] = {}
     for module_name in module_names:
@@ -123,19 +158,13 @@ def main() -> None:
             }
             for partition_idx in range(args.num_partitions)
         }
+        diagnostics[module_name]["aggregate"] = {"original": [], "reconstructed": []}
 
     try:
         with torch.no_grad():
-            for text in texts:
+            for prepared_inputs in prepared_data.inputs:
                 capture.clear()
-                encoded = tokenizer(
-                    text,
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=args.sequence_length,
-                )
-                encoded = {key: value.to(device) for key, value in encoded.items()}
+                encoded = {key: value.to(device) for key, value in prepared_inputs.items()}
                 model(**encoded)
 
                 for module_name, module_payload in module_payloads:
@@ -150,16 +179,27 @@ def main() -> None:
                     selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
                     for input_tensor in inputs:
                         partials = compute_row_parallel_partials_for_module(module, input_tensor, args.num_partitions)
+                        reconstructed_partials: list[torch.Tensor] = []
                         for partition_idx, partial in enumerate(partials):
-                            scale = scales[partition_idx]
+                            scale = scales[partition_idx].to(device=partial.device, dtype=torch.float32)
                             q = quantize_symmetric(partial, scale, num_bits=args.num_bits)
-                            reconstructed = dequantize_symmetric(q, scale, dtype=torch.float32)
+                            reconstructed = dequantize_symmetric(q, scale, dtype=partial.dtype)
                             if selected_indices.numel() > 0:
-                                reconstructed[..., selected_indices] = partial[..., selected_indices]
+                                indices = selected_indices.to(device=partial.device, dtype=torch.long)
+                                reconstructed[..., indices] = partial[..., indices]
+                            reconstructed_partials.append(reconstructed)
                             diagnostics[module_name][partition_idx]["original"].append(partial.to(torch.float32).cpu())
-                            diagnostics[module_name][partition_idx]["reconstructed"].append(reconstructed.cpu())
+                            diagnostics[module_name][partition_idx]["reconstructed"].append(reconstructed.to(torch.float32).cpu())
                             diagnostics[module_name][partition_idx]["q"].append(q.cpu())
                             diagnostics[module_name][partition_idx]["scale"].append(scale.cpu())
+                        original_sum = torch.stack(partials, dim=0).sum(dim=0)
+                        reconstructed_sum = torch.stack(reconstructed_partials, dim=0).sum(dim=0)
+                        bias = getattr(module, "bias", None)
+                        if bias is not None:
+                            original_sum = original_sum + bias.to(original_sum.dtype)
+                            reconstructed_sum = reconstructed_sum + bias.to(reconstructed_sum.dtype)
+                        diagnostics[module_name]["aggregate"]["original"].append(original_sum.float().cpu())
+                        diagnostics[module_name]["aggregate"]["reconstructed"].append(reconstructed_sum.float().cpu())
     finally:
         capture.remove()
 
@@ -167,13 +207,25 @@ def main() -> None:
         f"model_name={args.model_name}, mode={args.mode}, num_partitions={args.num_partitions}, "
         f"num_sequences={args.num_sequences}, sequence_length={args.sequence_length}, num_bits={args.num_bits}"
     )
+    output: dict[str, Any] = {"provenance": {
+        "sampling_strategy": args.sampling_strategy, "sampling_seed": args.seed,
+        "selected_chunk_ids": prepared_data.selected_chunk_ids,
+        "total_available_chunk_count": prepared_data.total_available_chunks,
+        "excluded_calibration_chunk_ids": calibration_ids,
+        "padding_used": prepared_data.padding_used,
+        "separator_token_policy": prepared_data.separator_token_policy,
+        "requested_dtype": args.dtype, "actual_parameter_dtype": str(next(model.parameters()).dtype),
+    }, "modules": {}}
     for module_name, module_payload in module_payloads:
         if module_name not in diagnostics:
             continue
         selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
         print(f"\nmodule={module_name}")
         print(f"selected_fraction={selected_indices.numel() / int(module_payload['feature_dim']):.6f}")
+        output["modules"][module_name] = {}
         for partition_idx, partition_data in diagnostics[module_name].items():
+            if partition_idx == "aggregate":
+                continue
             if not partition_data["original"]:
                 continue
             original = torch.cat(partition_data["original"], dim=0)
@@ -188,6 +240,8 @@ def main() -> None:
                 qmax=qmax,
                 selected_indices=selected_indices,
             )
+            stats.update(int4_payload_saturation_rates(q, selected_indices, qmin, qmax))
+            output["modules"][module_name][str(partition_idx)] = stats
             print(f"  partition={partition_idx}")
             print(f"    partial_mean={float(original.mean().item()):.6f}")
             print(f"    partial_std={float(original.std(unbiased=False).item()):.6f}")
@@ -200,6 +254,8 @@ def main() -> None:
             print(f"    quantized_max={stats.get('quantized_max', 0.0):.6f}")
             print(f"    saturation_low_rate={stats.get('saturation_low_rate', 0.0):.6f}")
             print(f"    saturation_high_rate={stats.get('saturation_high_rate', 0.0):.6f}")
+            print(f"    int4_payload_saturation_low_rate={stats['int4_payload_saturation_low_rate']:.6f}")
+            print(f"    int4_payload_saturation_high_rate={stats['int4_payload_saturation_high_rate']:.6f}")
             print(f"    mean_abs_error={stats['mean_abs_error']:.6f}")
             print(f"    max_abs_error={stats['max_abs_error']:.6f}")
             print(f"    rmse={stats['rmse']:.6f}")
@@ -208,6 +264,24 @@ def main() -> None:
             if selected_indices.numel() > 0:
                 print(f"    selected_mean_abs_error={stats['selected_mean_abs_error']:.6f}")
                 print(f"    non_selected_mean_abs_error={stats['non_selected_mean_abs_error']:.6f}")
+        aggregate = diagnostics[module_name]["aggregate"]
+        if aggregate["original"]:
+            aggregate_stats = quantization_error_stats(
+                torch.cat(aggregate["original"], dim=0), torch.cat(aggregate["reconstructed"], dim=0)
+            )
+            partition_stats = [value for key, value in output["modules"][module_name].items() if key != "aggregate"]
+            for key in (
+                "saturation_low_rate", "saturation_high_rate", "int4_payload_saturation_low_rate",
+                "int4_payload_saturation_high_rate", "selected_mean_abs_error", "non_selected_mean_abs_error",
+            ):
+                values = [float(stats[key]) for stats in partition_stats if key in stats]
+                if values:
+                    aggregate_stats[key] = statistics.mean(values)
+            output["modules"][module_name]["aggregate"] = aggregate_stats
+            print(f"  aggregate_rmse={aggregate_stats['rmse']:.6f}")
+    if args.output_path:
+        with open(args.output_path, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2)
 
 
 if __name__ == "__main__":

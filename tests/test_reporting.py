@@ -147,6 +147,7 @@ def test_eval_lm_harness_filters_reporting_metrics_and_selects_primary_scores() 
                 "sample_len,none": 17.0,
             },
             "boolq": {"acc,none": 0.6, "sample_len,none": 4.0},
+            "hellaswag": {"acc,none": 0.7, "acc_norm,none": 0.8},
             "other": {"exact_match,none": 0.7, "f1,none": 0.8},
         }
     }
@@ -159,6 +160,7 @@ def test_eval_lm_harness_filters_reporting_metrics_and_selects_primary_scores() 
     assert {(row["task"], row["metric"]) for row in primary} == {
         ("arc_easy", "acc_norm,none"),
         ("boolq", "acc,none"),
+        ("hellaswag", "acc,none"),
         ("other", "exact_match,none"),
     }
 

@@ -362,7 +362,14 @@ def extract_rows(mode: str, results: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def primary_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    preferred_order = ["acc_norm,none", "acc,none", "exact_match,none"]
+    task_metrics = {
+        "arc_easy": "acc_norm,none",
+        "arc_challenge": "acc_norm,none",
+        "winogrande": "acc,none",
+        "hellaswag": "acc,none",
+        "boolq": "acc,none",
+    }
+    fallback_order = ["acc_norm,none", "acc,none", "exact_match,none"]
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         key = (str(row["mode"]), str(row["task"]))
@@ -371,7 +378,9 @@ def primary_metric_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     for _key, task_rows in grouped.items():
         picked = None
-        for metric_name in preferred_order:
+        task_name = str(task_rows[0]["task"])
+        preferred_order = [task_metrics[task_name], *fallback_order] if task_name in task_metrics else fallback_order
+        for metric_name in dict.fromkeys(preferred_order):
             picked = next((row for row in task_rows if row["metric"] == metric_name), None)
             if picked is not None:
                 break

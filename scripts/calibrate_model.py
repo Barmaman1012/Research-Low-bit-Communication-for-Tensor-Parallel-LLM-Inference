@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import platform
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+import datasets
 import torch
+import transformers
 from datasets import load_dataset
 from huggingface_hub.errors import HfUriError
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -17,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
+from lowbit_tp_comm.calibration_data import VALID_SAMPLING_STRATEGIES, prepare_calibration_data
 from lowbit_tp_comm.dtypes import (
     DTYPE_CHOICES,
     ensure_dtype_supported,
@@ -35,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_name", default="wikitext")
     parser.add_argument("--dataset_config", default="wikitext-2-raw-v1")
     parser.add_argument("--split", default="train")
+    parser.add_argument("--dataset_revision", default=None)
     parser.add_argument("--num_sequences", type=int, default=32)
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--gamma", type=float, default=0.01)
@@ -46,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
     parser.add_argument("--simulate_row_parallel_calibration", action="store_true")
     parser.add_argument("--num_partitions", type=int, default=2)
+    parser.add_argument("--sampling_strategy", choices=VALID_SAMPLING_STRATEGIES, default="legacy_first_records")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--model_revision", default=None)
+    parser.add_argument("--tokenizer_revision", default=None)
     return parser.parse_args()
 
 
@@ -87,15 +97,22 @@ def build_inputs(
     }
 
 
-def load_text_dataset(dataset_name: str, dataset_config: str, split: str):
+def load_text_dataset(dataset_name: str, dataset_config: str, split: str, revision: str | None = None):
     try:
-        return load_dataset(dataset_name, dataset_config, split=split)
+        return load_dataset(dataset_name, dataset_config, split=split, revision=revision)
     except HfUriError:
         if "/" in dataset_name:
             raise
         fallback_name = f"Salesforce/{dataset_name}"
         print(f"Retrying dataset load with namespaced path: {fallback_name}")
-        return load_dataset(fallback_name, dataset_config, split=split)
+        return load_dataset(fallback_name, dataset_config, split=split, revision=revision)
+
+
+def git_commit_hash() -> str | None:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def build_dtype_metadata(
@@ -130,8 +147,12 @@ def main() -> None:
     requested_dtype = resolve_dtype(args.dtype)
     ensure_dtype_supported(requested_dtype, device)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs(args.dtype))
+        tokenizer_kwargs = {"revision": args.tokenizer_revision} if args.tokenizer_revision is not None else {}
+        model_kwargs = {"revision": args.model_revision} if args.model_revision is not None else {}
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, **tokenizer_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, **model_kwargs, **model_load_kwargs(args.dtype)
+        )
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -144,8 +165,13 @@ def main() -> None:
     validate_model_dtype(model, requested_dtype)
     model_device = next(model.parameters()).device
 
-    dataset = load_text_dataset(args.dataset_name, args.dataset_config, split=args.split)
-    texts = select_nonempty_texts(dataset, args.num_sequences)
+    if args.sampling_strategy == "legacy_first_records":
+        print("Warning: legacy_first_records is not paper-style random token-chunk calibration.")
+    dataset = load_text_dataset(args.dataset_name, args.dataset_config, args.split, args.dataset_revision)
+    prepared_data = prepare_calibration_data(
+        dataset, tokenizer, num_sequences=args.num_sequences, sequence_length=args.sequence_length,
+        sampling_strategy=args.sampling_strategy, seed=args.seed,
+    )
 
     candidate_modules = list_candidate_sync_modules(
         model,
@@ -171,9 +197,9 @@ def main() -> None:
 
     try:
         with torch.no_grad():
-            for index, text in enumerate(texts, start=1):
+            for index, prepared_inputs in enumerate(prepared_data.inputs, start=1):
                 capture.clear()
-                encoded = build_inputs(tokenizer, [text], args.sequence_length, model_device)
+                encoded = {key: value.to(model_device) for key, value in prepared_inputs.items()}
                 model(**encoded)
 
                 for module_name in candidate_names:
@@ -210,8 +236,8 @@ def main() -> None:
                                 )
                             calibrators[module_name].update([output_tensor])
 
-                if index % 8 == 0 or index == len(texts):
-                    print(f"Processed {index}/{len(texts)} sequences")
+                if index % 8 == 0 or index == len(prepared_data.inputs):
+                    print(f"Processed {index}/{len(prepared_data.inputs)} sequences")
     finally:
         capture.remove()
 
@@ -242,6 +268,21 @@ def main() -> None:
 
     payload = {
         "model_name": args.model_name,
+        "model_revision": args.model_revision,
+        "resolved_model_revision": getattr(getattr(model, "config", None), "_commit_hash", None) or args.model_revision,
+        "tokenizer_name": getattr(tokenizer, "name_or_path", args.model_name),
+        "tokenizer_revision": args.tokenizer_revision,
+        "resolved_tokenizer_revision": getattr(tokenizer, "init_kwargs", {}).get("_commit_hash") or args.tokenizer_revision,
+        "dataset_name": args.dataset_name,
+        "dataset_config": args.dataset_config,
+        "dataset_revision": args.dataset_revision,
+        "split": args.split,
+        "sampling_strategy": args.sampling_strategy,
+        "sampling_seed": args.seed,
+        "selected_chunk_ids": prepared_data.selected_chunk_ids,
+        "total_available_chunk_count": prepared_data.total_available_chunks,
+        "padding_used": prepared_data.padding_used,
+        "separator_token_policy": prepared_data.separator_token_policy,
         "gamma": args.gamma,
         "k_fraction": args.k_fraction,
         "num_sequences": args.num_sequences,
@@ -256,6 +297,11 @@ def main() -> None:
             calibrators=calibrators,
             observed_partial_dtypes=observed_partial_dtypes,
         ),
+        "git_commit": git_commit_hash(),
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "datasets_version": datasets.__version__,
         "modules": module_payload,
     }
     torch.save(payload, args.output_path)
