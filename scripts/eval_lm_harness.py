@@ -41,7 +41,7 @@ try:
 except ImportError:  # pragma: no cover
     Conv1D = None
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"]
 
 
@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modes", default=None)
     parser.add_argument("--num_partitions", type=int, default=2)
     parser.add_argument("--num_bits", type=int, default=4)
+    parser.add_argument("--int8_fraction", type=float, default=0.015625)
     parser.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--device", default="cpu")
@@ -234,6 +235,7 @@ def build_model_for_mode(
     seed: int,
     dtype_name: str = "auto",
     model_revision: str | None = None,
+    int8_fraction: float = 0.015625,
 ):
     model = load_model_or_raise(model_name, device, dtype_name, model_revision)
     calibration = None
@@ -255,6 +257,7 @@ def build_model_for_mode(
             num_partitions=num_partitions,
             num_bits=num_bits,
             seed=seed,
+            int8_fraction=int8_fraction,
         )
         replace_modules_by_name(model, replacements)
         # Replacements include calibration buffers loaded from CPU.  Move the
@@ -338,6 +341,7 @@ def build_run_metadata(
         "modes": modes,
         "num_partitions": args.num_partitions,
         "num_bits": args.num_bits,
+        "int8_fraction": getattr(args, "int8_fraction", 0.0),
         "calibration_path": args.calibration_path,
         "target_style": args.target_style,
         "git_commit": _git_commit_hash(),
@@ -351,6 +355,20 @@ def build_run_metadata(
                 "scale_dtype": str(module.scales_per_partition.dtype),
                 "selected_feature_communication_dtype": str(module.output_dtype),
             }
+            if hasattr(module, "int8_feature_indices"):
+                feature_dim = int(module.out_features)
+                bf16_count = int(module.bf16_feature_indices.numel())
+                int8_count = int(module.int8_feature_indices.numel())
+                replacement_metadata[name].update({
+                    "selection_strategy": "calibrated_int8" if args.mode == "selected_bf16_int8" else "random_int8",
+                    "bf16_feature_count": bf16_count,
+                    "int8_feature_count": int8_count,
+                    "int4_feature_count": feature_dim - bf16_count - int8_count,
+                    "bf16_fraction": bf16_count / feature_dim,
+                    "int8_fraction": int8_count / feature_dim,
+                    "int4_fraction": (feature_dim - bf16_count - int8_count) / feature_dim,
+                    "average_bits_per_value": 4 + 12 * bf16_count / feature_dim + 4 * int8_count / feature_dim,
+                })
     metadata["replacement_dtypes"] = replacement_metadata
     return metadata
 
@@ -466,6 +484,7 @@ def main() -> None:
             seed=args.seed,
             dtype_name=args.dtype,
             model_revision=args.model_revision,
+            int8_fraction=args.int8_fraction,
         )
         lm = HFLM(
             pretrained=model,

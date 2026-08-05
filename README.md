@@ -273,6 +273,25 @@ The original paper evaluates much larger models, including Gemma 2 27B, Llama 2 
 
 ## Notes
 
+## Experimental three-tier extension
+
+This repository also contains an experimental extension, not part of the
+original paper: selected BF16 features, a second Int8 tier, and Int4 for the
+remaining features. It reuses an existing calibration artifact; it does not
+change the original two-tier modes.
+
+Original two-tier results belong under `results/mistral_nemo_tp8_random_chunks/`:
+
+```bash
+PYTHONPATH=src python scripts/eval_lm_harness.py --model_revision a4477a2f977929a969745b69bbd62e03043551a5 --tokenizer_revision a4477a2f977929a969745b69bbd62e03043551a5 --modes full,int4,random_bf16,selected_bf16 --output_path results/mistral_nemo_tp8_random_chunks/two_tier.json
+```
+
+Three-tier experimental results belong under `results/mistral_nemo_tp8_three_tier/`:
+
+```bash
+PYTHONPATH=src python scripts/eval_lm_harness.py --model_revision a4477a2f977929a969745b69bbd62e03043551a5 --tokenizer_revision a4477a2f977929a969745b69bbd62e03043551a5 --modes selected_bf16_int8,selected_bf16_random_int8 --int8_fraction 0.015625 --output_path results/mistral_nemo_tp8_three_tier/three_tier.json
+```
+
 - This is still a numerical communication simulation. Int4 values are stored in `torch.int8`; true bandwidth savings would require bit-packing.
 - Calibration collected with `num_partitions=1` is currently repeated across simulated partitions during replacement. Real tensor-parallel calibration would need partition-specific statistics.
 - The Hugging Face and `datasets` stacks may emit a Python 3.12 `resource_tracker` shutdown warning after successful runs. The current scripts still complete and save results correctly.

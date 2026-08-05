@@ -108,6 +108,44 @@ def hybrid_quant_dequant(
     return reconstructed
 
 
+def multi_tier_quant_dequant(
+    x: Tensor,
+    int4_scale: Tensor,
+    int8_scale: Tensor,
+    bf16_feature_indices: Tensor | Sequence[int] | None = None,
+    int8_feature_indices: Tensor | Sequence[int] | None = None,
+    output_dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Simulate disjoint BF16, Int8, and Int4 communicated feature tiers."""
+
+    feature_dim = x.shape[-1]
+
+    def normalize(values: Tensor | Sequence[int] | None) -> Tensor:
+        if values is None:
+            result = torch.empty(0, dtype=torch.long, device=x.device)
+        elif isinstance(values, Tensor):
+            result = values.to(device=x.device, dtype=torch.long)
+        else:
+            result = torch.tensor(list(values), dtype=torch.long, device=x.device)
+        if result.numel() and (result.min() < 0 or result.max() >= feature_dim):
+            raise ValueError("Feature indices are out of range.")
+        if result.numel() != result.unique().numel():
+            raise ValueError("Feature indices must not contain duplicates.")
+        return result
+
+    bf16_indices = normalize(bf16_feature_indices)
+    int8_indices = normalize(int8_feature_indices)
+    if bf16_indices.numel() and int8_indices.numel() and torch.isin(bf16_indices, int8_indices).any():
+        raise ValueError("BF16 and Int8 feature indices must be disjoint.")
+    reconstructed = dequantize_symmetric(quantize_symmetric(x, int4_scale, num_bits=4), int4_scale, dtype=output_dtype)
+    if int8_indices.numel():
+        int8 = dequantize_symmetric(quantize_symmetric(x, int8_scale, num_bits=8), int8_scale, dtype=output_dtype)
+        reconstructed[..., int8_indices] = int8[..., int8_indices]
+    if bf16_indices.numel():
+        reconstructed[..., bf16_indices] = x[..., bf16_indices].to(output_dtype)
+    return reconstructed
+
+
 def quantization_error_stats(
     original: Tensor,
     reconstructed: Tensor,

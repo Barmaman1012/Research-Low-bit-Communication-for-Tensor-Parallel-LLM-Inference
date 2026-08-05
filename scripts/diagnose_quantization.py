@@ -26,6 +26,7 @@ from lowbit_tp_comm.quantization import (
     get_qmin_qmax,
     quantization_error_stats,
     quantize_symmetric,
+    multi_tier_quant_dequant,
 )
 from lowbit_tp_comm.tp_linear import compute_row_parallel_partials_for_module, make_random_bf16_indices
 
@@ -39,10 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_sequences", type=int, default=16)
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16"], default="selected_bf16")
+    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"], default="selected_bf16")
     parser.add_argument("--top_modules", type=int, default=12)
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--int8_fraction", type=float, default=0.015625)
     parser.add_argument("--dtype", choices=DTYPE_CHOICES, default="auto")
     parser.add_argument("--sampling_strategy", choices=VALID_SAMPLING_STRATEGIES, default="random_token_chunks")
     parser.add_argument("--dataset_revision", default=None)
@@ -80,11 +82,25 @@ def select_nonempty_texts(dataset, num_sequences: int) -> list[str]:
 def choose_selected_indices(module_payload: dict[str, Any], mode: str, seed: int) -> torch.Tensor:
     feature_dim = int(module_payload["feature_dim"])
     k = int(module_payload["k"])
-    if mode == "selected_bf16":
+    if mode in {"selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}:
         return module_payload["topk_indices"].to(dtype=torch.long)
     if mode == "random_bf16":
         return make_random_bf16_indices(feature_dim, k, seed=seed)
     return torch.empty(0, dtype=torch.long)
+
+
+def choose_int8_indices(module_payload: dict[str, Any], mode: str, seed: int, int8_fraction: float) -> torch.Tensor:
+    if mode not in {"selected_bf16_int8", "selected_bf16_random_int8"}:
+        return torch.empty(0, dtype=torch.long)
+    feature_dim, k = int(module_payload["feature_dim"]), int(module_payload["k"])
+    k_int8 = int(feature_dim * int8_fraction)
+    bf16 = module_payload["topk_indices"].to(dtype=torch.long)
+    ranked = torch.argsort(module_payload["aggregated_ranges"], descending=True)
+    complement = ranked[~torch.isin(ranked, bf16)]
+    if mode == "selected_bf16_int8":
+        return complement[:k_int8]
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return complement[torch.randperm(complement.numel(), generator=generator)[:k_int8]]
 
 
 def flatten_records(records: list[torch.Tensor]) -> torch.Tensor:
@@ -92,19 +108,46 @@ def flatten_records(records: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(flattened, dim=0) if flattened else torch.empty(0, dtype=torch.float32)
 
 
-def int4_payload_saturation_rates(q: torch.Tensor, selected_indices: torch.Tensor, qmin: int, qmax: int) -> dict[str, float]:
-    """Measure saturation only for values actually transmitted as Int4."""
+def _tier_mask(feature_dim: int, indices: torch.Tensor, device: torch.device) -> torch.Tensor:
+    mask = torch.zeros(feature_dim, dtype=torch.bool, device=device)
+    if indices.numel():
+        mask[indices.to(device=device, dtype=torch.long)] = True
+    return mask
 
-    mask = torch.ones(q.shape[-1], dtype=torch.bool, device=q.device)
-    if selected_indices.numel():
-        mask[selected_indices.to(device=q.device, dtype=torch.long)] = False
+
+def _payload_saturation(q: torch.Tensor, mask: torch.Tensor, qmin: int, qmax: int, prefix: str) -> dict[str, float]:
+    """Empty payloads report zero saturation rather than NaN."""
+
     payload = q[..., mask]
     if payload.numel() == 0:
-        return {"int4_payload_saturation_low_rate": 0.0, "int4_payload_saturation_high_rate": 0.0}
+        return {f"{prefix}_payload_saturation_low_rate": 0.0, f"{prefix}_payload_saturation_high_rate": 0.0}
     return {
-        "int4_payload_saturation_low_rate": float((payload == qmin).float().mean().item()),
-        "int4_payload_saturation_high_rate": float((payload == qmax).float().mean().item()),
+        f"{prefix}_payload_saturation_low_rate": float((payload == qmin).float().mean().item()),
+        f"{prefix}_payload_saturation_high_rate": float((payload == qmax).float().mean().item()),
     }
+
+
+def three_tier_diagnostic_stats(
+    original: torch.Tensor, reconstructed: torch.Tensor, q4: torch.Tensor, q8: torch.Tensor,
+    bf16_indices: torch.Tensor, int8_indices: torch.Tensor,
+) -> dict[str, float]:
+    """Payload-specific saturation and reconstruction errors for three tiers."""
+
+    feature_dim = original.shape[-1]
+    bf16_mask = _tier_mask(feature_dim, bf16_indices, original.device)
+    int8_mask = _tier_mask(feature_dim, int8_indices, original.device)
+    int4_mask = ~(bf16_mask | int8_mask)
+    stats = quantization_error_stats(original, reconstructed)
+    error = (reconstructed.float() - original.float()).abs()
+    for name, mask in (("bf16", bf16_mask), ("int8", int8_mask), ("int4", int4_mask)):
+        values = error[..., mask]
+        stats[f"{name}_mean_abs_error"] = float(values.mean().item()) if values.numel() else 0.0
+        stats[f"{name}_max_abs_error"] = float(values.max().item()) if values.numel() else 0.0
+        stats[f"{name}_fraction"] = float(mask.float().mean().item())
+    stats.update(_payload_saturation(q4, int4_mask, -8, 7, "int4"))
+    stats.update(_payload_saturation(q8, int8_mask, -128, 127, "int8"))
+    stats["average_bits_per_value"] = 16 * stats["bf16_fraction"] + 8 * stats["int8_fraction"] + 4 * stats["int4_fraction"]
+    return stats
 
 
 def main() -> None:
@@ -154,6 +197,7 @@ def main() -> None:
                 "original": [],
                 "reconstructed": [],
                 "q": [],
+                "q8": [],
                 "scale": [],
             }
             for partition_idx in range(args.num_partitions)
@@ -177,13 +221,22 @@ def main() -> None:
                     calibrator = EMAMinMaxCalibrator.from_state_dict(module_payload["state_dict"])
                     scales = calibrator.scales_per_partition()
                     selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
+                    int8_indices = choose_int8_indices(module_payload, args.mode, args.seed, args.int8_fraction)
+                    int8_scales = calibrator.scales_per_partition(num_bits=8)
                     for input_tensor in inputs:
                         partials = compute_row_parallel_partials_for_module(module, input_tensor, args.num_partitions)
                         reconstructed_partials: list[torch.Tensor] = []
                         for partition_idx, partial in enumerate(partials):
                             scale = scales[partition_idx].to(device=partial.device, dtype=torch.float32)
                             q = quantize_symmetric(partial, scale, num_bits=args.num_bits)
-                            reconstructed = dequantize_symmetric(q, scale, dtype=partial.dtype)
+                            q8 = quantize_symmetric(partial, int8_scales[partition_idx].to(device=partial.device), num_bits=8)
+                            if int8_indices.numel():
+                                reconstructed = multi_tier_quant_dequant(
+                                    partial, scale, int8_scales[partition_idx].to(device=partial.device),
+                                    selected_indices, int8_indices, partial.dtype,
+                                )
+                            else:
+                                reconstructed = dequantize_symmetric(q, scale, dtype=partial.dtype)
                             if selected_indices.numel() > 0:
                                 indices = selected_indices.to(device=partial.device, dtype=torch.long)
                                 reconstructed[..., indices] = partial[..., indices]
@@ -191,6 +244,7 @@ def main() -> None:
                             diagnostics[module_name][partition_idx]["original"].append(partial.to(torch.float32).cpu())
                             diagnostics[module_name][partition_idx]["reconstructed"].append(reconstructed.to(torch.float32).cpu())
                             diagnostics[module_name][partition_idx]["q"].append(q.cpu())
+                            diagnostics[module_name][partition_idx]["q8"].append(q8.cpu())
                             diagnostics[module_name][partition_idx]["scale"].append(scale.cpu())
                         original_sum = torch.stack(partials, dim=0).sum(dim=0)
                         reconstructed_sum = torch.stack(reconstructed_partials, dim=0).sum(dim=0)
@@ -208,6 +262,9 @@ def main() -> None:
         f"num_sequences={args.num_sequences}, sequence_length={args.sequence_length}, num_bits={args.num_bits}"
     )
     output: dict[str, Any] = {"provenance": {
+        "mode": args.mode, "calibration_path": args.calibration_path, "int8_fraction": args.int8_fraction,
+        "model_name": args.model_name, "model_revision": args.model_revision,
+        "tokenizer_revision": args.tokenizer_revision, "dataset_revision": args.dataset_revision,
         "sampling_strategy": args.sampling_strategy, "sampling_seed": args.seed,
         "selected_chunk_ids": prepared_data.selected_chunk_ids,
         "total_available_chunk_count": prepared_data.total_available_chunks,
@@ -220,6 +277,8 @@ def main() -> None:
         if module_name not in diagnostics:
             continue
         selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
+        int8_indices = choose_int8_indices(module_payload, args.mode, args.seed, args.int8_fraction)
+        is_three_tier = args.mode in {"selected_bf16_int8", "selected_bf16_random_int8"}
         print(f"\nmodule={module_name}")
         print(f"selected_fraction={selected_indices.numel() / int(module_payload['feature_dim']):.6f}")
         output["modules"][module_name] = {}
@@ -231,16 +290,14 @@ def main() -> None:
             original = torch.cat(partition_data["original"], dim=0)
             reconstructed = torch.cat(partition_data["reconstructed"], dim=0)
             q = torch.cat(partition_data["q"], dim=0)
+            q8 = torch.cat(partition_data["q8"], dim=0)
             scale = partition_data["scale"][0]
-            stats = quantization_error_stats(
-                original,
-                reconstructed,
-                q=q,
-                qmin=qmin,
-                qmax=qmax,
-                selected_indices=selected_indices,
-            )
-            stats.update(int4_payload_saturation_rates(q, selected_indices, qmin, qmax))
+            if is_three_tier:
+                stats = three_tier_diagnostic_stats(original, reconstructed, q, q8, selected_indices, int8_indices)
+            else:
+                stats = quantization_error_stats(original, reconstructed, q=q, qmin=qmin, qmax=qmax, selected_indices=selected_indices)
+                int4_mask = ~_tier_mask(original.shape[-1], selected_indices, original.device)
+                stats.update(_payload_saturation(q, int4_mask, qmin, qmax, "int4"))
             output["modules"][module_name][str(partition_idx)] = stats
             print(f"  partition={partition_idx}")
             print(f"    partial_mean={float(original.mean().item()):.6f}")
@@ -261,22 +318,39 @@ def main() -> None:
             print(f"    rmse={stats['rmse']:.6f}")
             print(f"    mean_signed_error={stats['mean_signed_error']:.6f}")
             print(f"    relative_rmse={stats['relative_rmse']:.6f}")
+            if is_three_tier:
+                for key in ("bf16_mean_abs_error", "int8_mean_abs_error", "int4_mean_abs_error", "int8_payload_saturation_low_rate", "int8_payload_saturation_high_rate", "average_bits_per_value"):
+                    print(f"    {key}={stats[key]:.6f}")
             if selected_indices.numel() > 0:
                 print(f"    selected_mean_abs_error={stats['selected_mean_abs_error']:.6f}")
                 print(f"    non_selected_mean_abs_error={stats['non_selected_mean_abs_error']:.6f}")
         aggregate = diagnostics[module_name]["aggregate"]
         if aggregate["original"]:
-            aggregate_stats = quantization_error_stats(
-                torch.cat(aggregate["original"], dim=0), torch.cat(aggregate["reconstructed"], dim=0)
-            )
+            aggregate_original = torch.cat(aggregate["original"], dim=0)
+            aggregate_reconstructed = torch.cat(aggregate["reconstructed"], dim=0)
+            aggregate_stats = quantization_error_stats(aggregate_original, aggregate_reconstructed)
             partition_stats = [value for key, value in output["modules"][module_name].items() if key != "aggregate"]
             for key in (
                 "saturation_low_rate", "saturation_high_rate", "int4_payload_saturation_low_rate",
-                "int4_payload_saturation_high_rate", "selected_mean_abs_error", "non_selected_mean_abs_error",
+                "int4_payload_saturation_high_rate", "int8_payload_saturation_low_rate",
+                "int8_payload_saturation_high_rate", "selected_mean_abs_error", "non_selected_mean_abs_error",
             ):
                 values = [float(stats[key]) for stats in partition_stats if key in stats]
                 if values:
                     aggregate_stats[key] = statistics.mean(values)
+            if is_three_tier:
+                bf16_mask = _tier_mask(aggregate_original.shape[-1], selected_indices, aggregate_original.device)
+                int8_mask = _tier_mask(aggregate_original.shape[-1], int8_indices, aggregate_original.device)
+                int4_mask = ~(bf16_mask | int8_mask)
+                absolute = (aggregate_reconstructed - aggregate_original).abs()
+                for name, mask in (("bf16", bf16_mask), ("int8", int8_mask), ("int4", int4_mask)):
+                    values = absolute[..., mask]
+                    aggregate_stats[f"{name}_mean_abs_error"] = float(values.mean().item()) if values.numel() else 0.0
+                    aggregate_stats[f"{name}_max_abs_error"] = float(values.max().item()) if values.numel() else 0.0
+                    aggregate_stats[f"{name}_fraction"] = float(mask.float().mean().item())
+                aggregate_stats["average_bits_per_value"] = (
+                    16 * aggregate_stats["bf16_fraction"] + 8 * aggregate_stats["int8_fraction"] + 4 * aggregate_stats["int4_fraction"]
+                )
             output["modules"][module_name]["aggregate"] = aggregate_stats
             print(f"  aggregate_rmse={aggregate_stats['rmse']:.6f}")
     if args.output_path:

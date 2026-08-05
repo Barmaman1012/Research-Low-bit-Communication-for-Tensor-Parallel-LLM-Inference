@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import math
 from typing import Any, Literal, Protocol, Sequence
 
 import torch
@@ -14,6 +15,8 @@ from .tp_linear import (
     HybridQuantizedRowParallelLinear,
     RowParallelConv1D,
     RowParallelLinear,
+    ThreeTierRowParallelConv1D,
+    ThreeTierRowParallelLinear,
     make_random_bf16_indices,
 )
 
@@ -244,13 +247,16 @@ def build_hybrid_replacements_from_calibration(
     num_partitions: int,
     num_bits: int = 4,
     seed: int = 0,
+    int8_fraction: float = 0.015625,
 ) -> dict[str, nn.Module]:
     """Construct simulated row-parallel module replacements from calibration results."""
 
     if mode == "full":
         return {}
-    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16"}:
+    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}:
         raise ValueError(f"Unsupported mode: {mode}.")
+    if not 0.0 <= int8_fraction <= 1.0:
+        raise ValueError("int8_fraction must be in [0, 1].")
 
     replacements: dict[str, nn.Module] = {}
     named_modules = dict(model.named_modules())
@@ -277,6 +283,8 @@ def build_hybrid_replacements_from_calibration(
 
         k = int(module_payload["k"])
         feature_dim = int(module_payload["feature_dim"])
+        if k > feature_dim or k + math.floor(feature_dim * int8_fraction) > feature_dim:
+            raise ValueError("BF16 and Int8 feature counts exceed feature dimension.")
         if mode == "tp_uncompressed":
             bf16_indices = None
         elif mode == "all_bf16":
@@ -285,9 +293,22 @@ def build_hybrid_replacements_from_calibration(
             bf16_indices = torch.empty(0, dtype=torch.long)
         elif mode == "selected_bf16":
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
+        elif mode in {"selected_bf16_int8", "selected_bf16_random_int8"}:
+            bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
         else:
             bf16_indices = make_random_bf16_indices(feature_dim, k, seed=seed)
 
+        is_three_tier = mode in {"selected_bf16_int8", "selected_bf16_random_int8"}
+        if is_three_tier:
+            k_int8 = math.floor(feature_dim * int8_fraction)
+            ranked = torch.argsort(module_payload["aggregated_ranges"], descending=True)
+            complement = ranked[~torch.isin(ranked, bf16_indices)]
+            if mode == "selected_bf16_int8":
+                int8_indices = complement[:k_int8]
+            else:
+                generator = torch.Generator(device="cpu").manual_seed(seed)
+                int8_indices = complement[torch.randperm(complement.numel(), generator=generator)[:k_int8]]
+            int8_scales = calibrator.scales_per_partition(num_bits=8)
         output_dtype = getattr(getattr(original_module, "weight", None), "dtype", torch.float32)
         module_device = getattr(getattr(original_module, "weight", None), "device", torch.device("cpu"))
         if isinstance(original_module, nn.Linear):
@@ -295,6 +316,14 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = RowParallelLinear.from_linear(
                     original_module,
                     num_partitions=num_partitions,
+                )
+            elif is_three_tier:
+                replacements[module_name] = ThreeTierRowParallelLinear(
+                    original_module.weight, original_module.bias, num_partitions,
+                    scales.to(device=module_device, dtype=torch.float32), bf16_indices.to(device=module_device),
+                    num_bits=num_bits, output_dtype=output_dtype,
+                    int8_scales_per_partition=int8_scales.to(device=module_device, dtype=torch.float32),
+                    int8_feature_indices=int8_indices.to(device=module_device),
                 )
             else:
                 replacements[module_name] = HybridQuantizedRowParallelLinear.from_linear(
@@ -313,6 +342,14 @@ def build_hybrid_replacements_from_calibration(
                 replacements[module_name] = RowParallelConv1D.from_conv1d(
                     original_module,
                     num_partitions=num_partitions,
+                )
+            elif is_three_tier:
+                replacements[module_name] = ThreeTierRowParallelConv1D(
+                    original_module.weight, original_module.bias, num_partitions,
+                    scales.to(device=module_device, dtype=torch.float32), bf16_indices.to(device=module_device),
+                    num_bits=num_bits, output_dtype=output_dtype,
+                    int8_scales_per_partition=int8_scales.to(device=module_device, dtype=torch.float32),
+                    int8_feature_indices=int8_indices.to(device=module_device),
                 )
             else:
                 replacements[module_name] = HybridQuantizedRowParallelConv1D.from_conv1d(

@@ -30,7 +30,7 @@ from lowbit_tp_comm.dtypes import (
     validate_module_devices_and_dtypes,
 )
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose_bits", action="store_true")
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
     parser.add_argument("--num_bits", type=int, default=4)
+    parser.add_argument("--int8_fraction", type=float, default=0.015625)
     return parser.parse_args()
 
 
@@ -111,6 +112,7 @@ def compute_bits_summary(
     calibration: dict[str, Any] | None,
     num_bits: int = 4,
     selected_feature_dtype: torch.dtype = torch.bfloat16,
+    int8_fraction: float = 0.015625,
 ) -> tuple[float, list[dict[str, float | int | str]]]:
     if mode == "full":
         return 16.0, []
@@ -127,15 +129,21 @@ def compute_bits_summary(
     for module_name, module_payload in calibration["modules"].items():
         feature_dim = int(module_payload["feature_dim"])
         k = int(module_payload["k"])
+        k_int8 = math.floor(feature_dim * int8_fraction) if mode in {"selected_bf16_int8", "selected_bf16_random_int8"} else 0
+        if k + k_int8 > feature_dim:
+            raise ValueError("BF16 and Int8 feature counts exceed feature dimension.")
         selected_fraction = k / feature_dim if feature_dim > 0 else 0.0
         avg_bits = compute_module_avg_bits(
             feature_dim, k, num_bits=num_bits, selected_bits=dtype_bits(selected_feature_dtype)
         )
+        if k_int8:
+            avg_bits += (8 - num_bits) * k_int8 / feature_dim
         module_rows.append(
             {
                 "module_name": module_name,
                 "feature_dim": feature_dim,
                 "k": k,
+                "k_int8": k_int8,
                 "selected_fraction": selected_fraction,
                 "avg_bits": avg_bits,
             }
@@ -155,6 +163,7 @@ def build_model_for_mode(
     target_style: str,
     num_bits: int,
     dtype_name: str = "auto",
+    int8_fraction: float = 0.015625,
 ) -> tuple[torch.nn.Module, dict[str, Any] | None]:
     requested_dtype = resolve_dtype(dtype_name)
     ensure_dtype_supported(requested_dtype, device)
@@ -190,6 +199,7 @@ def build_model_for_mode(
             num_partitions=num_partitions,
             num_bits=num_bits,
             seed=seed,
+            int8_fraction=int8_fraction,
         )
         replace_modules_by_name(model, replacements)
 
@@ -226,6 +236,7 @@ def evaluate_mode(
     target_style: str,
     num_bits: int,
     dtype_name: str = "auto",
+    int8_fraction: float = 0.015625,
 ) -> dict[str, float | str]:
     model, calibration = build_model_for_mode(
         model_name=model_name,
@@ -237,11 +248,12 @@ def evaluate_mode(
         target_style=target_style,
         num_bits=num_bits,
         dtype_name=dtype_name,
+        int8_fraction=int8_fraction,
     )
     model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
     avg_bits, module_rows = compute_bits_summary(
-        mode, calibration, num_bits=num_bits, selected_feature_dtype=model_dtype
+        mode, calibration, num_bits=num_bits, selected_feature_dtype=model_dtype, int8_fraction=int8_fraction
     )
 
     if verbose_bits and module_rows:
@@ -276,6 +288,11 @@ def evaluate_mode(
         "perplexity": perplexity,
         "avg_bits_per_value": avg_bits,
         "actual_model_dtype": str(model_dtype),
+        "int8_fraction": int8_fraction if mode in {"selected_bf16_int8", "selected_bf16_random_int8"} else 0.0,
+        "selection_strategy": (
+            "calibrated_int8" if mode == "selected_bf16_int8" else "random_int8"
+            if mode == "selected_bf16_random_int8" else None
+        ),
     }
 
 
@@ -343,6 +360,7 @@ def main() -> None:
             target_style=args.target_style,
             num_bits=args.num_bits,
             dtype_name=args.dtype,
+            int8_fraction=args.int8_fraction,
         )
         for mode in modes
     ]

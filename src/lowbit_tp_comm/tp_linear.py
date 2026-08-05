@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
-from .quantization import hybrid_quant_dequant
+from .quantization import hybrid_quant_dequant, multi_tier_quant_dequant
 
 try:
     from transformers.pytorch_utils import Conv1D
@@ -504,6 +504,59 @@ class HybridQuantizedRowParallelConv1D(_HybridQuantizedRowParallelBase):
             num_bits=num_bits,
             output_dtype=output_dtype,
         )
+
+
+class ThreeTierRowParallelLinear(HybridQuantizedRowParallelLinear):
+    """Experimental BF16 + Int8 + Int4 row-parallel ``nn.Linear`` simulation."""
+
+    def __init__(self, *args, int8_scales_per_partition: Tensor, int8_feature_indices: Tensor, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if int8_scales_per_partition.shape != self.scales_per_partition.shape:
+            raise ValueError("Int8 scales must match Int4 per-partition scale shape.")
+        self.register_buffer("int8_scales_per_partition", int8_scales_per_partition.detach().clone())
+        self.register_buffer("int8_feature_indices", int8_feature_indices.detach().to(dtype=torch.long))
+
+    def forward(self, x: Tensor) -> Tensor:
+        parts = self._split_input(x)
+        weights = self.weight.split(self.partition_size, dim=1)
+        reconstructed = [
+            multi_tier_quant_dequant(
+                torch.matmul(x_i, w_i.transpose(0, 1)), self.scales_per_partition[i],
+                self.int8_scales_per_partition[i], self.bf16_feature_indices, self.int8_feature_indices,
+                self.output_dtype,
+            )
+            for i, (x_i, w_i) in enumerate(zip(parts, weights, strict=True))
+        ]
+        y = torch.stack(reconstructed, dim=0).sum(dim=0)
+        if self.bias is not None:
+            y = y + self.bias.to(self.output_dtype)
+        return self._validate_output_dtype(y)
+
+
+class ThreeTierRowParallelConv1D(HybridQuantizedRowParallelConv1D):
+    """Experimental BF16 + Int8 + Int4 GPT-2 Conv1D simulation."""
+
+    def __init__(self, *args, int8_scales_per_partition: Tensor, int8_feature_indices: Tensor, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if int8_scales_per_partition.shape != self.scales_per_partition.shape:
+            raise ValueError("Int8 scales must match Int4 per-partition scale shape.")
+        self.register_buffer("int8_scales_per_partition", int8_scales_per_partition.detach().clone())
+        self.register_buffer("int8_feature_indices", int8_feature_indices.detach().to(dtype=torch.long))
+
+    def forward(self, x: Tensor) -> Tensor:
+        parts = self._split_input(x)
+        weights = self.weight.split(self.partition_size, dim=0)
+        reconstructed = [
+            multi_tier_quant_dequant(
+                torch.matmul(x_i, w_i), self.scales_per_partition[i], self.int8_scales_per_partition[i],
+                self.bf16_feature_indices, self.int8_feature_indices, self.output_dtype,
+            )
+            for i, (x_i, w_i) in enumerate(zip(parts, weights, strict=True))
+        ]
+        y = torch.stack(reconstructed, dim=0).sum(dim=0)
+        if self.bias is not None:
+            y = y + self.bias.to(self.output_dtype)
+        return self._validate_output_dtype(y)
 
 
 class SimulatedTPLinear(nn.Module):
