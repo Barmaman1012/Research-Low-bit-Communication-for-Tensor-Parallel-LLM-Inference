@@ -48,6 +48,8 @@ DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate simulated TP modes with lm-eval-harness.")
     parser.add_argument("--model_name", default="distilgpt2")
+    parser.add_argument("--model_revision", default=None)
+    parser.add_argument("--tokenizer_revision", default=None)
     parser.add_argument("--calibration_path", default=None)
     parser.add_argument(
         "--target_style",
@@ -96,11 +98,17 @@ def safe_import_lm_eval():
     return lm_eval, HFLM
 
 
-def load_model_or_raise(model_name: str, device: torch.device, dtype_name: str = "auto"):
+def load_model_or_raise(
+    model_name: str,
+    device: torch.device,
+    dtype_name: str = "auto",
+    model_revision: str | None = None,
+):
     requested_dtype = resolve_dtype(dtype_name)
     ensure_dtype_supported(requested_dtype, device)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs(dtype_name))
+        revision_kwargs = {"revision": model_revision} if model_revision is not None else {}
+        model = AutoModelForCausalLM.from_pretrained(model_name, **revision_kwargs, **model_load_kwargs(dtype_name))
     except Exception:
         print(
             "Model loading failed. This model may be gated. "
@@ -114,9 +122,10 @@ def load_model_or_raise(model_name: str, device: torch.device, dtype_name: str =
     return model
 
 
-def load_tokenizer_or_raise(model_name: str):
+def load_tokenizer_or_raise(model_name: str, tokenizer_revision: str | None = None):
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        revision_kwargs = {"revision": tokenizer_revision} if tokenizer_revision is not None else {}
+        tokenizer = AutoTokenizer.from_pretrained(model_name, **revision_kwargs)
     except Exception:
         print(
             "Tokenizer loading failed. This model may be gated. "
@@ -224,8 +233,9 @@ def build_model_for_mode(
     device: torch.device,
     seed: int,
     dtype_name: str = "auto",
+    model_revision: str | None = None,
 ):
-    model = load_model_or_raise(model_name, device, dtype_name)
+    model = load_model_or_raise(model_name, device, dtype_name, model_revision)
     calibration = None
     if mode != "full":
         if calibration_path is None:
@@ -306,7 +316,13 @@ def build_run_metadata(
 ) -> dict[str, Any]:
     metadata = {
         "model_name": args.model_name,
+        "model_revision": getattr(args, "model_revision", None),
+        "resolved_model_revision": getattr(getattr(model, "config", None), "_commit_hash", None)
+        or getattr(args, "model_revision", None),
         "tokenizer_name": getattr(tokenizer, "name_or_path", None),
+        "tokenizer_revision": getattr(args, "tokenizer_revision", None),
+        "resolved_tokenizer_revision": getattr(tokenizer, "init_kwargs", {}).get("_commit_hash")
+        or getattr(args, "tokenizer_revision", None),
         "requested_device": args.device,
         "requested_model_dtype": getattr(args, "dtype", "auto"),
         "torch_version": torch.__version__,
@@ -432,7 +448,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    tokenizer = load_tokenizer_or_raise(args.model_name)
+    tokenizer = load_tokenizer_or_raise(args.model_name, args.tokenizer_revision)
     tasks = parse_csv_list(args.tasks, default=DEFAULT_TASKS)
     modes = parse_modes(args.mode, args.modes)
 
@@ -449,6 +465,7 @@ def main() -> None:
             device=device,
             seed=args.seed,
             dtype_name=args.dtype,
+            model_revision=args.model_revision,
         )
         lm = HFLM(
             pretrained=model,

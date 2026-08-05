@@ -80,6 +80,61 @@ def test_eval_lm_harness_table_formatting() -> None:
     assert "int4 | 0.400000" in summary
 
 
+def test_eval_lm_harness_parser_accepts_revision_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    monkeypatch.setattr(sys, "argv", ["eval_lm_harness.py", "--model_revision", "model-sha", "--tokenizer_revision", "tokenizer-sha"])
+
+    args = harness_module.parse_args()
+
+    assert args.model_revision == "model-sha"
+    assert args.tokenizer_revision == "tokenizer-sha"
+
+
+def test_eval_lm_harness_loaders_forward_optional_revisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    captured: dict[str, dict] = {}
+
+    class FakeModelLoader:
+        @staticmethod
+        def from_pretrained(_name, **kwargs):
+            captured["model"] = kwargs
+            return nn.Linear(2, 2)
+
+    class FakeTokenizer:
+        eos_token = "<eos>"
+        pad_token = None
+
+    class FakeTokenizerLoader:
+        @staticmethod
+        def from_pretrained(_name, **kwargs):
+            captured["tokenizer"] = kwargs
+            return FakeTokenizer()
+
+    monkeypatch.setattr(harness_module, "AutoModelForCausalLM", FakeModelLoader)
+    monkeypatch.setattr(harness_module, "AutoTokenizer", FakeTokenizerLoader)
+    harness_module.load_model_or_raise("fake", torch.device("cpu"), model_revision="model-sha")
+    harness_module.load_tokenizer_or_raise("fake", tokenizer_revision="tokenizer-sha")
+
+    assert captured["model"]["revision"] == "model-sha"
+    assert captured["tokenizer"]["revision"] == "tokenizer-sha"
+
+
+def test_eval_lm_harness_omits_revision_kwargs_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    captured: dict[str, dict] = {}
+
+    class FakeModelLoader:
+        @staticmethod
+        def from_pretrained(_name, **kwargs):
+            captured["model"] = kwargs
+            return nn.Linear(2, 2)
+
+    monkeypatch.setattr(harness_module, "AutoModelForCausalLM", FakeModelLoader)
+    harness_module.load_model_or_raise("fake", torch.device("cpu"))
+
+    assert "revision" not in captured["model"]
+
+
 def test_eval_lm_harness_uses_zero_shot_and_supported_deterministic_seeds() -> None:
     harness_module = _load_script_module("eval_lm_harness.py")
 
@@ -169,6 +224,8 @@ def test_eval_lm_harness_metadata_is_json_serializable() -> None:
     harness_module = _load_script_module("eval_lm_harness.py")
     args = SimpleNamespace(
         model_name="fake-model",
+        model_revision="requested-model-sha",
+        tokenizer_revision="requested-tokenizer-sha",
         device="cpu",
         limit=10,
         batch_size="1",
@@ -179,7 +236,7 @@ def test_eval_lm_harness_metadata_is_json_serializable() -> None:
         calibration_path="calibration.pt",
         target_style="gpt2",
     )
-    tokenizer = SimpleNamespace(name_or_path="fake-tokenizer")
+    tokenizer = SimpleNamespace(name_or_path="fake-tokenizer", init_kwargs={"_commit_hash": "resolved-tokenizer-sha"})
     lm_eval = SimpleNamespace(__version__="test-version")
 
     metadata = harness_module.build_run_metadata(
@@ -194,6 +251,10 @@ def test_eval_lm_harness_metadata_is_json_serializable() -> None:
     assert metadata["num_fewshot"] == 0
     assert metadata["actual_model_device"] == "cpu"
     assert metadata["model_parameter_dtype"] == "torch.float32"
+    assert metadata["model_revision"] == "requested-model-sha"
+    assert metadata["resolved_model_revision"] == "requested-model-sha"
+    assert metadata["tokenizer_revision"] == "requested-tokenizer-sha"
+    assert metadata["resolved_tokenizer_revision"] == "resolved-tokenizer-sha"
     json.dumps(harness_module.make_json_serializable(metadata))
 
 
