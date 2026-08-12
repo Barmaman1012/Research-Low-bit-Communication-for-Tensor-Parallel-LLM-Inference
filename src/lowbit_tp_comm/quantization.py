@@ -6,6 +6,12 @@ from typing import Any, Sequence
 import torch
 from torch import Tensor
 
+
+# Kept here with the two-tier quantization implementation so callers have one
+# canonical spelling for the experimental mode.  It deliberately has no Int8
+# counterpart: selected channels are restored with the normal BF16 + Int4 path.
+THRESHOLD_BF16_MODE = "threshold_bf16"
+
 @dataclass(slots=True)
 class QuantizedTensor:
     """Container for simulated quantized communication payloads."""

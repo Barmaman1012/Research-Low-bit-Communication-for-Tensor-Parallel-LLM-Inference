@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ if str(SRC) not in sys.path:
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
 from lowbit_tp_comm.calibration_data import VALID_SAMPLING_STRATEGIES, prepare_calibration_data
 from lowbit_tp_comm.dtypes import DTYPE_CHOICES, ensure_dtype_supported, model_load_kwargs, resolve_dtype, validate_model_dtype, validate_module_devices_and_dtypes
-from lowbit_tp_comm.hooks import ModuleInputOutputCapture, list_candidate_sync_modules
+from lowbit_tp_comm.hooks import ModuleInputOutputCapture, derive_threshold_bf16_selection, list_candidate_sync_modules
 from lowbit_tp_comm.quantization import (
     dequantize_symmetric,
     get_qmin_qmax,
@@ -40,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_sequences", type=int, default=16)
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"], default="selected_bf16")
+    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16", "threshold_bf16", "selected_bf16_int8", "selected_bf16_random_int8"], default="selected_bf16")
     parser.add_argument("--top_modules", type=int, default=12)
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
@@ -79,13 +81,17 @@ def select_nonempty_texts(dataset, num_sequences: int) -> list[str]:
     return texts
 
 
-def choose_selected_indices(module_payload: dict[str, Any], mode: str, seed: int) -> torch.Tensor:
+def choose_selected_indices(module_payload: dict[str, Any], mode: str, seed: int, threshold_indices: torch.Tensor | None = None) -> torch.Tensor:
     feature_dim = int(module_payload["feature_dim"])
     k = int(module_payload["k"])
     if mode in {"selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}:
         return module_payload["topk_indices"].to(dtype=torch.long)
     if mode == "random_bf16":
         return make_random_bf16_indices(feature_dim, k, seed=seed)
+    if mode == "threshold_bf16":
+        if threshold_indices is None:
+            raise ValueError("threshold_bf16 selection was not derived.")
+        return threshold_indices.to(dtype=torch.long)
     return torch.empty(0, dtype=torch.long)
 
 
@@ -178,6 +184,10 @@ def main() -> None:
     validate_model_dtype(model, requested_dtype)
     validate_module_devices_and_dtypes(model, device, requested_dtype)
 
+    threshold_selection = (
+        derive_threshold_bf16_selection(calibration, model=model) if args.mode == "threshold_bf16" else None
+    )
+
     candidate_names = [name for name, _module in list_candidate_sync_modules(model, target_style=args.target_style)]
     module_names = [name for name, _payload in module_payloads if name in candidate_names]
     capture = ModuleInputOutputCapture(model, module_names, store_on_cpu=device.type != "cuda")
@@ -220,7 +230,8 @@ def main() -> None:
                     module = module_lookup[module_name]
                     calibrator = EMAMinMaxCalibrator.from_state_dict(module_payload["state_dict"])
                     scales = calibrator.scales_per_partition()
-                    selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
+                    threshold_indices = None if threshold_selection is None else threshold_selection["indices_by_module"][module_name]
+                    selected_indices = choose_selected_indices(module_payload, args.mode, args.seed, threshold_indices)
                     int8_indices = choose_int8_indices(module_payload, args.mode, args.seed, args.int8_fraction)
                     int8_scales = calibrator.scales_per_partition(num_bits=8)
                     for input_tensor in inputs:
@@ -261,6 +272,11 @@ def main() -> None:
         f"model_name={args.model_name}, mode={args.mode}, num_partitions={args.num_partitions}, "
         f"num_sequences={args.num_sequences}, sequence_length={args.sequence_length}, num_bits={args.num_bits}"
     )
+    calibration_sha256 = hashlib.sha256(Path(args.calibration_path).read_bytes()).hexdigest()
+    try:
+        git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = None
     output: dict[str, Any] = {"provenance": {
         "mode": args.mode, "calibration_path": args.calibration_path, "int8_fraction": args.int8_fraction,
         "model_name": args.model_name, "model_revision": args.model_revision,
@@ -272,11 +288,17 @@ def main() -> None:
         "padding_used": prepared_data.padding_used,
         "separator_token_policy": prepared_data.separator_token_policy,
         "requested_dtype": args.dtype, "actual_parameter_dtype": str(next(model.parameters()).dtype),
+        "calibration_sha256": calibration_sha256, "git_commit": git_commit,
     }, "modules": {}}
+    if threshold_selection is not None:
+        output["provenance"]["threshold_bf16"] = {
+            key: value for key, value in threshold_selection.items() if key != "indices_by_module"
+        }
     for module_name, module_payload in module_payloads:
         if module_name not in diagnostics:
             continue
-        selected_indices = choose_selected_indices(module_payload, args.mode, args.seed)
+        threshold_indices = None if threshold_selection is None else threshold_selection["indices_by_module"][module_name]
+        selected_indices = choose_selected_indices(module_payload, args.mode, args.seed, threshold_indices)
         int8_indices = choose_int8_indices(module_payload, args.mode, args.seed, args.int8_fraction)
         is_three_tier = args.mode in {"selected_bf16_int8", "selected_bf16_random_int8"}
         print(f"\nmodule={module_name}")

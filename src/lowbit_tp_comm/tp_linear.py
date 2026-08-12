@@ -7,6 +7,11 @@ from torch import Tensor, nn
 
 from .quantization import hybrid_quant_dequant, multi_tier_quant_dequant
 
+
+# ``threshold_bf16`` uses HybridQuantizedRowParallel{Linear,Conv1D} directly.
+# No extra layer class or Int8 buffers are needed because the reconstruction is
+# exactly the existing selected-BF16 + Int4 reconstruction.
+
 try:
     from transformers.pytorch_utils import Conv1D
 except ImportError:  # pragma: no cover - transformers is part of requirements, but keep import safe.

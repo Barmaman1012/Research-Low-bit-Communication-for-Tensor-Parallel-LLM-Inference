@@ -298,3 +298,21 @@ PYTHONPATH=src python scripts/eval_lm_harness.py --model_revision a4477a2f977929
 - Perplexity on small evaluation slices can behave strangely, especially when the slice is only tens or hundreds of sequences.
 - The paper reports zero-shot task accuracy, not only perplexity, so perplexity alone is not enough to judge whether selected BF16 is working as intended.
 - We should not conclude that `selected_bf16` fails until we run larger evaluations and benchmark tasks.
+
+## Experimental global-threshold BF16
+
+`threshold_bf16` is an equal-budget numerical simulation for comparing global
+allocation against the fixed per-module selection. `selected_bf16` preserves
+`E/64` features independently in each module; `threshold_bf16` preserves the
+same total count across all calibrated modules, ranking each feature by its
+aggregated range divided by that module's median range. It uses BF16 for the
+global winners and the existing Int4 path for every other feature—there is no
+Int8 tier. This models equal theoretical communication budgets, not packed
+communication.
+
+```bash
+PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
+  --model_name mistralai/Mistral-Nemo-Instruct-2407 \
+  --calibration_path calibration-mistral-nemo-tp8.pt \
+  --target_style llama --mode threshold_bf16 --num_partitions 8
+```

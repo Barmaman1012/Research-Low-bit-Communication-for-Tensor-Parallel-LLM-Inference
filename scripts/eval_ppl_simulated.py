@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
+    derive_threshold_bf16_selection,
     list_candidate_sync_modules,
     replace_modules_by_name,
 )
@@ -30,7 +31,7 @@ from lowbit_tp_comm.dtypes import (
     validate_module_devices_and_dtypes,
 )
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,10 +126,11 @@ def compute_bits_summary(
     if calibration is None:
         raise ValueError("Calibration payload is required for hybrid modes.")
 
+    threshold_selection = derive_threshold_bf16_selection(calibration) if mode == "threshold_bf16" else None
     module_rows: list[dict[str, float | int | str]] = []
     for module_name, module_payload in calibration["modules"].items():
         feature_dim = int(module_payload["feature_dim"])
-        k = int(module_payload["k"])
+        k = int(threshold_selection["per_module"][module_name]["bf16_count"]) if threshold_selection else int(module_payload["k"])
         k_int8 = math.floor(feature_dim * int8_fraction) if mode in {"selected_bf16_int8", "selected_bf16_random_int8"} else 0
         if k + k_int8 > feature_dim:
             raise ValueError("BF16 and Int8 feature counts exceed feature dimension.")
@@ -191,7 +193,9 @@ def build_model_for_mode(
             for module_name, payload in calibration["modules"].items()
             if module_name in candidate_names
         }
-        calibration = {**calibration, "modules": filtered_modules}
+        # Threshold selection is global over every artifact target.  Keep the
+        # full mapping so the replacement builder can reject missing targets.
+        calibration = {**calibration, "modules": calibration["modules"] if mode == "threshold_bf16" else filtered_modules}
         replacements = build_hybrid_replacements_from_calibration(
             model,
             calibration=calibration,

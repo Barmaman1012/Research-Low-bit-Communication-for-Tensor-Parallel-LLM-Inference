@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import platform
@@ -25,7 +26,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, replace_modules_by_name
+from lowbit_tp_comm.hooks import (
+    build_hybrid_replacements_from_calibration,
+    replace_modules_by_name,
+)
 from lowbit_tp_comm.dtypes import (
     DTYPE_CHOICES,
     ensure_dtype_supported,
@@ -41,7 +45,7 @@ try:
 except ImportError:  # pragma: no cover
     Conv1D = None
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"]
 
 
@@ -308,6 +312,16 @@ def _git_commit_hash() -> str | None:
         return None
 
 
+def _sha256_file(path: str | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def build_run_metadata(
     *,
     args: argparse.Namespace,
@@ -347,6 +361,18 @@ def build_run_metadata(
         "git_commit": _git_commit_hash(),
     }
     metadata.update(model_dtype_metadata(model))
+    if args.mode == "threshold_bf16":
+        selection = next(
+            (module.threshold_bf16_metadata for module in model.modules() if hasattr(module, "threshold_bf16_metadata")),
+            None,
+        )
+        if selection is None:
+            raise RuntimeError("threshold_bf16 replacements are missing construction-time allocation metadata.")
+        metadata["threshold_bf16"] = {
+            **selection,
+            "calibration_path": args.calibration_path,
+            "calibration_sha256": _sha256_file(args.calibration_path),
+        }
     replacement_metadata: dict[str, Any] = {}
     for name, module in model.named_modules():
         if hasattr(module, "output_dtype") and hasattr(module, "scales_per_partition"):

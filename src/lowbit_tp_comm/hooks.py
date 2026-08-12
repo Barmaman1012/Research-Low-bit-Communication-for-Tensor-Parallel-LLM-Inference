@@ -10,6 +10,7 @@ from torch import Tensor, nn
 from torch.utils.hooks import RemovableHandle
 
 from .calibration import EMAMinMaxCalibrator
+from .quantization import THRESHOLD_BF16_MODE
 from .tp_linear import (
     HybridQuantizedRowParallelConv1D,
     HybridQuantizedRowParallelLinear,
@@ -240,6 +241,109 @@ def replace_modules_by_name(model: nn.Module, replacements: dict[str, nn.Module]
         _set_child_module(parent_module, child_name, replacement)
 
 
+def derive_threshold_bf16_selection(
+    calibration: dict[str, Any],
+    *,
+    model: nn.Module | None = None,
+) -> dict[str, Any]:
+    """Allocate the selected-BF16 budget globally by module-median range.
+
+    Ranking is intentionally done once, on CPU, with an explicit secondary
+    order of module name then feature index.  This makes equal boundary scores
+    deterministic and avoids any sorting work in replacement forwards.
+    """
+
+    modules = calibration.get("modules")
+    if not isinstance(modules, dict) or not modules:
+        raise ValueError("threshold_bf16 requires a non-empty calibration 'modules' mapping.")
+
+    named_modules = dict(model.named_modules()) if model is not None else {}
+    entries: list[tuple[float, str, int]] = []
+    module_feature_dims: dict[str, int] = {}
+    target_count = 0
+    for module_name in sorted(modules):
+        payload = modules[module_name]
+        if not isinstance(payload, dict):
+            raise ValueError(f"Calibration entry for {module_name!r} must be a mapping.")
+        if model is not None and module_name not in named_modules:
+            raise ValueError(f"Calibrated target module {module_name!r} is not present in the model.")
+        try:
+            feature_dim = int(payload["feature_dim"])
+            k = int(payload["k"])
+            ranges = payload["aggregated_ranges"]
+        except KeyError as exc:
+            raise ValueError(f"Calibration entry for {module_name!r} is missing {exc.args[0]!r}.") from exc
+        if feature_dim <= 0 or not 0 <= k <= feature_dim:
+            raise ValueError(f"Invalid feature_dim/k for calibrated target module {module_name!r}.")
+        if not isinstance(ranges, Tensor) or ranges.ndim != 1 or ranges.numel() != feature_dim:
+            actual = tuple(ranges.shape) if isinstance(ranges, Tensor) else type(ranges).__name__
+            raise ValueError(
+                f"aggregated_ranges for {module_name!r} must have shape [{feature_dim}], got {actual}."
+            )
+        if model is not None:
+            model_feature_dim = _module_feature_dim_for_threshold(named_modules[module_name])
+            if model_feature_dim != feature_dim:
+                raise ValueError(
+                    f"Calibration feature dimension mismatch for {module_name!r}: "
+                    f"artifact has {feature_dim}, but model requires {model_feature_dim}."
+                )
+        values = ranges.detach().to(device="cpu", dtype=torch.float32)
+        median = values.median()
+        if not torch.isfinite(median) or median.item() <= 0:
+            raise ValueError(f"aggregated_ranges median for {module_name!r} must be finite and positive.")
+        normalized = values / median
+        if not torch.isfinite(normalized).all():
+            raise ValueError(f"aggregated_ranges for {module_name!r} must be finite.")
+        entries.extend((float(score), module_name, index) for index, score in enumerate(normalized.tolist()))
+        module_feature_dims[module_name] = feature_dim
+        target_count += k
+
+    if target_count > len(entries):  # defensive; k validation above should imply this.
+        raise ValueError("threshold_bf16 target BF16 count exceeds total calibrated features.")
+    ranked = sorted(entries, key=lambda item: (-item[0], item[1], item[2]))
+    selected = ranked[:target_count]
+    next_excluded = ranked[target_count] if target_count < len(ranked) else None
+    threshold = selected[-1][0] if selected else None
+    boundary_tie = bool(next_excluded is not None and threshold == next_excluded[0])
+    indices_by_module = {name: [] for name in module_feature_dims}
+    for _score, module_name, index in selected:
+        indices_by_module[module_name].append(index)
+    per_module = {
+        name: {
+            "bf16_count": len(indices_by_module[name]),
+            "bf16_fraction": len(indices_by_module[name]) / module_feature_dims[name],
+            "feature_dim": module_feature_dims[name],
+        }
+        for name in sorted(module_feature_dims)
+    }
+    total_features = len(entries)
+    return {
+        "mode": THRESHOLD_BF16_MODE,
+        "normalization_method": "module_median",
+        "total_feature_count": total_features,
+        "target_bf16_count": target_count,
+        "actual_bf16_count": len(selected),
+        "derived_threshold": threshold,
+        "next_excluded_score": None if next_excluded is None else next_excluded[0],
+        "boundary_tie": boundary_tie,
+        "per_module": per_module,
+        "global_bf16_fraction": len(selected) / total_features,
+        "global_int4_fraction": (total_features - len(selected)) / total_features,
+        "average_bits_per_value": 4.0 + 12.0 * len(selected) / total_features,
+        "indices_by_module": {
+            name: torch.tensor(indices, dtype=torch.long) for name, indices in indices_by_module.items()
+        },
+    }
+
+
+def _module_feature_dim_for_threshold(module: nn.Module) -> int:
+    if isinstance(module, nn.Linear):
+        return int(module.out_features)
+    if Conv1D is not None and isinstance(module, Conv1D):
+        return int(module.weight.shape[1])
+    raise TypeError(f"Unsupported calibrated target module type: {type(module)}")
+
+
 def build_hybrid_replacements_from_calibration(
     model: nn.Module,
     calibration: dict,
@@ -253,15 +357,18 @@ def build_hybrid_replacements_from_calibration(
 
     if mode == "full":
         return {}
-    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}:
+    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", THRESHOLD_BF16_MODE, "selected_bf16_int8", "selected_bf16_random_int8"}:
         raise ValueError(f"Unsupported mode: {mode}.")
     if not 0.0 <= int8_fraction <= 1.0:
         raise ValueError("int8_fraction must be in [0, 1].")
 
+    threshold_selection = derive_threshold_bf16_selection(calibration, model=model) if mode == THRESHOLD_BF16_MODE else None
     replacements: dict[str, nn.Module] = {}
     named_modules = dict(model.named_modules())
     for module_name, module_payload in calibration["modules"].items():
         if module_name not in named_modules:
+            if mode == THRESHOLD_BF16_MODE:
+                raise ValueError(f"Calibrated target module {module_name!r} is not present in the model.")
             continue
         original_module = named_modules[module_name]
         calibrator = EMAMinMaxCalibrator.from_state_dict(module_payload["state_dict"])
@@ -293,6 +400,9 @@ def build_hybrid_replacements_from_calibration(
             bf16_indices = torch.empty(0, dtype=torch.long)
         elif mode == "selected_bf16":
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
+        elif mode == THRESHOLD_BF16_MODE:
+            assert threshold_selection is not None
+            bf16_indices = threshold_selection["indices_by_module"][module_name]
         elif mode in {"selected_bf16_int8", "selected_bf16_random_int8"}:
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
         else:
@@ -362,4 +472,10 @@ def build_hybrid_replacements_from_calibration(
                 )
         else:
             raise TypeError(f"Unsupported module type for replacement: {module_name} ({type(original_module)}).")
+    if threshold_selection is not None:
+        # Preserve construction-time provenance for result writers without
+        # retaining a second BF16 allocation or adding any quantization state.
+        metadata = {key: value for key, value in threshold_selection.items() if key != "indices_by_module"}
+        for replacement in replacements.values():
+            replacement.threshold_bf16_metadata = metadata
     return replacements
