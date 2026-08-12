@@ -29,6 +29,7 @@ if str(SRC) not in sys.path:
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
     replace_modules_by_name,
+    threshold_bf16_result_metadata,
 )
 from lowbit_tp_comm.dtypes import (
     DTYPE_CHOICES,
@@ -330,7 +331,9 @@ def build_run_metadata(
     lm_eval: Any,
     tasks: list[str],
     modes: list[str],
+    mode: str | None = None,
 ) -> dict[str, Any]:
+    effective_mode = mode or args.mode
     metadata = {
         "model_name": args.model_name,
         "model_revision": getattr(args, "model_revision", None),
@@ -351,7 +354,7 @@ def build_run_metadata(
         "limit": args.limit,
         "batch_size": args.batch_size,
         "seed": args.seed,
-        "mode": args.mode,
+        "mode": effective_mode,
         "modes": modes,
         "num_partitions": args.num_partitions,
         "num_bits": args.num_bits,
@@ -361,18 +364,18 @@ def build_run_metadata(
         "git_commit": _git_commit_hash(),
     }
     metadata.update(model_dtype_metadata(model))
-    if args.mode == "threshold_bf16":
+    if effective_mode == "threshold_bf16":
         selection = next(
-            (module.threshold_bf16_metadata for module in model.modules() if hasattr(module, "threshold_bf16_metadata")),
+            (module.threshold_bf16_allocation for module in model.modules() if hasattr(module, "threshold_bf16_allocation")),
             None,
         )
         if selection is None:
             raise RuntimeError("threshold_bf16 replacements are missing construction-time allocation metadata.")
-        metadata["threshold_bf16"] = {
-            **selection,
-            "calibration_path": args.calibration_path,
-            "calibration_sha256": _sha256_file(args.calibration_path),
-        }
+        metadata["threshold_bf16"] = threshold_bf16_result_metadata(
+            selection,
+            calibration_path=args.calibration_path,
+            calibration_sha256=_sha256_file(args.calibration_path),
+        )
     replacement_metadata: dict[str, Any] = {}
     for name, module in model.named_modules():
         if hasattr(module, "output_dtype") and hasattr(module, "scales_per_partition"):
@@ -537,6 +540,7 @@ def main() -> None:
             lm_eval=lm_eval,
             tasks=tasks,
             modes=modes,
+            mode=mode,
         )
         all_rows.extend(extract_rows(mode, results))
 

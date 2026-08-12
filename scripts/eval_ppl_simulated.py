@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ from lowbit_tp_comm.hooks import (
     derive_threshold_bf16_selection,
     list_candidate_sync_modules,
     replace_modules_by_name,
+    threshold_bf16_result_metadata,
 )
 from lowbit_tp_comm.dtypes import (
     DTYPE_CHOICES,
@@ -241,7 +243,7 @@ def evaluate_mode(
     num_bits: int,
     dtype_name: str = "auto",
     int8_fraction: float = 0.015625,
-) -> dict[str, float | str]:
+) -> dict[str, Any]:
     model, calibration = build_model_for_mode(
         model_name=model_name,
         mode=mode,
@@ -286,7 +288,7 @@ def evaluate_mode(
 
     avg_loss = sum(losses) / len(losses)
     perplexity = math.exp(avg_loss)
-    return {
+    result: dict[str, Any] = {
         "mode": mode,
         "avg_loss": avg_loss,
         "perplexity": perplexity,
@@ -298,6 +300,19 @@ def evaluate_mode(
             if mode == "selected_bf16_random_int8" else None
         ),
     }
+    if mode == "threshold_bf16":
+        selection = next(
+            (module.threshold_bf16_allocation for module in model.modules() if hasattr(module, "threshold_bf16_allocation")),
+            None,
+        )
+        if selection is None:
+            raise RuntimeError("threshold_bf16 replacements are missing construction-time allocation metadata.")
+        result["threshold_bf16"] = threshold_bf16_result_metadata(
+            selection,
+            calibration_path=calibration_path,
+            calibration_sha256=hashlib.sha256(Path(calibration_path).read_bytes()).hexdigest(),
+        )
+    return result
 
 
 def print_single_result(result: dict[str, float | str], model_name: str, num_sequences: int, sequence_length: int) -> None:

@@ -22,7 +22,12 @@ if str(SRC) not in sys.path:
 from lowbit_tp_comm.calibration import EMAMinMaxCalibrator
 from lowbit_tp_comm.calibration_data import VALID_SAMPLING_STRATEGIES, prepare_calibration_data
 from lowbit_tp_comm.dtypes import DTYPE_CHOICES, ensure_dtype_supported, model_load_kwargs, resolve_dtype, validate_model_dtype, validate_module_devices_and_dtypes
-from lowbit_tp_comm.hooks import ModuleInputOutputCapture, derive_threshold_bf16_selection, list_candidate_sync_modules
+from lowbit_tp_comm.hooks import (
+    ModuleInputOutputCapture,
+    derive_threshold_bf16_selection,
+    list_candidate_sync_modules,
+    threshold_bf16_result_metadata,
+)
 from lowbit_tp_comm.quantization import (
     dequantize_symmetric,
     get_qmin_qmax,
@@ -291,9 +296,11 @@ def main() -> None:
         "calibration_sha256": calibration_sha256, "git_commit": git_commit,
     }, "modules": {}}
     if threshold_selection is not None:
-        output["provenance"]["threshold_bf16"] = {
-            key: value for key, value in threshold_selection.items() if key != "indices_by_module"
-        }
+        output["provenance"]["threshold_bf16"] = threshold_bf16_result_metadata(
+            threshold_selection,
+            calibration_path=args.calibration_path,
+            calibration_sha256=calibration_sha256,
+        )
     for module_name, module_payload in module_payloads:
         if module_name not in diagnostics:
             continue

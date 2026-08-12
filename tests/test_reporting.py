@@ -10,6 +10,8 @@ import pytest
 import torch
 from torch import nn
 
+from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, replace_modules_by_name
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -256,6 +258,58 @@ def test_eval_lm_harness_metadata_is_json_serializable() -> None:
     assert metadata["tokenizer_revision"] == "requested-tokenizer-sha"
     assert metadata["resolved_tokenizer_revision"] == "resolved-tokenizer-sha"
     json.dumps(harness_module.make_json_serializable(metadata))
+
+
+def test_threshold_bf16_harness_serializes_exact_allocation_metadata(tmp_path: Path) -> None:
+    harness_module = _load_script_module("eval_lm_harness.py")
+    calibration_path = tmp_path / "calibration.pt"
+    calibration_path.write_bytes(b"threshold-metadata-fixture")
+    model = nn.Module()
+    model.a_proj = nn.Linear(4, 4)
+    model.b_proj = nn.Linear(4, 4)
+
+    def payload(ranges: list[float], k: int) -> dict:
+        width = len(ranges)
+        return {
+            "state_dict": {
+                "min_vals": -torch.ones(2, width), "max_vals": torch.ones(2, width),
+                "initialized": True, "gamma": 0.01, "num_partitions": 2, "feature_dim": width,
+            },
+            "aggregated_ranges": torch.tensor(ranges), "topk_indices": torch.arange(k),
+            "k": k, "feature_dim": width,
+        }
+
+    calibration = {"modules": {"a_proj": payload([1, 1, 2, 4], 1), "b_proj": payload([1, 1, 1, 8], 1)}}
+    replace_modules_by_name(model, build_hybrid_replacements_from_calibration(model, calibration, "threshold_bf16", 2))
+    args = SimpleNamespace(
+        model_name="fake-model", model_revision=None, tokenizer_revision=None, device="cpu", limit=1,
+        batch_size="1", seed=0, mode="full", num_partitions=2, num_bits=4,
+        calibration_path=str(calibration_path), target_style="llama", int8_fraction=0.0,
+    )
+    metadata = harness_module.build_run_metadata(
+        args=args, model=model, tokenizer=SimpleNamespace(name_or_path="fake", init_kwargs={}),
+        lm_eval=SimpleNamespace(__version__="test"), tasks=["arc_easy"], modes=["full", "threshold_bf16"],
+        mode="threshold_bf16",
+    )
+    serialized = harness_module.make_json_serializable({"metadata": {"threshold_bf16": metadata}})
+    json.loads(json.dumps(serialized))
+    allocation = serialized["metadata"]["threshold_bf16"]["threshold_bf16"]
+    required = {
+        "mode", "normalization_method", "total_feature_count", "target_bf16_count", "actual_bf16_count",
+        "global_bf16_fraction", "global_int4_fraction", "average_bits_per_value", "derived_threshold",
+        "next_excluded_score", "boundary_tie", "deterministic_tie_breaking", "per_module_bf16_counts",
+        "per_module_bf16_fractions", "calibration_path", "calibration_sha256",
+    }
+    assert required <= allocation.keys()
+    assert allocation["mode"] == "threshold_bf16"
+    assert allocation["normalization_method"] == "module_median"
+    assert sum(allocation["per_module_bf16_counts"].values()) == allocation["actual_bf16_count"]
+    assert allocation["actual_bf16_count"] == allocation["target_bf16_count"]
+    assert allocation["global_bf16_fraction"] == allocation["actual_bf16_count"] / allocation["total_feature_count"]
+    assert allocation["global_int4_fraction"] == 1 - allocation["global_bf16_fraction"]
+    assert allocation["average_bits_per_value"] == (
+        16 * allocation["global_bf16_fraction"] + 4 * allocation["global_int4_fraction"]
+    )
 
 
 def test_eval_lm_harness_rejects_partition_specific_calibration_mismatch() -> None:

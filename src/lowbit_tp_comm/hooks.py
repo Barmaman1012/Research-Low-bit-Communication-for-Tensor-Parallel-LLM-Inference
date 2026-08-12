@@ -336,6 +336,37 @@ def derive_threshold_bf16_selection(
     }
 
 
+def threshold_bf16_result_metadata(
+    selection: dict[str, Any],
+    *,
+    calibration_path: str | None,
+    calibration_sha256: str | None,
+) -> dict[str, Any]:
+    """Serialize the exact construction-time threshold allocation for results."""
+
+    per_module = selection["per_module"]
+    counts = {name: int(details["bf16_count"]) for name, details in per_module.items()}
+    fractions = {name: float(details["bf16_fraction"]) for name, details in per_module.items()}
+    return {
+        "mode": THRESHOLD_BF16_MODE,
+        "normalization_method": selection["normalization_method"],
+        "total_feature_count": int(selection["total_feature_count"]),
+        "target_bf16_count": int(selection["target_bf16_count"]),
+        "actual_bf16_count": int(selection["actual_bf16_count"]),
+        "global_bf16_fraction": float(selection["global_bf16_fraction"]),
+        "global_int4_fraction": float(selection["global_int4_fraction"]),
+        "average_bits_per_value": float(selection["average_bits_per_value"]),
+        "derived_threshold": selection["derived_threshold"],
+        "next_excluded_score": selection["next_excluded_score"],
+        "boundary_tie": bool(selection["boundary_tie"]),
+        "deterministic_tie_breaking": "normalized_score_desc,module_name_asc,feature_index_asc",
+        "per_module_bf16_counts": counts,
+        "per_module_bf16_fractions": fractions,
+        "calibration_path": calibration_path,
+        "calibration_sha256": calibration_sha256,
+    }
+
+
 def _module_feature_dim_for_threshold(module: nn.Module) -> int:
     if isinstance(module, nn.Linear):
         return int(module.out_features)
@@ -473,9 +504,8 @@ def build_hybrid_replacements_from_calibration(
         else:
             raise TypeError(f"Unsupported module type for replacement: {module_name} ({type(original_module)}).")
     if threshold_selection is not None:
-        # Preserve construction-time provenance for result writers without
-        # retaining a second BF16 allocation or adding any quantization state.
-        metadata = {key: value for key, value in threshold_selection.items() if key != "indices_by_module"}
+        # Retain the exact construction-time allocation for result writers.
+        # It is ordinary Python provenance, not a buffer or a forward-path tier.
         for replacement in replacements.values():
-            replacement.threshold_bf16_metadata = metadata
+            replacement.threshold_bf16_allocation = threshold_selection
     return replacements
