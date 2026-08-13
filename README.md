@@ -316,3 +316,20 @@ PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
   --calibration_path calibration-mistral-nemo-tp8.pt \
   --target_style llama --mode threshold_bf16 --num_partitions 8
 ```
+
+## Range-threshold experiments
+
+`selected_bf16` keeps the fixed top `E/64` features independently in every module. Existing `threshold_bf16` instead uses the same total selected count globally, ranked by range divided by module median. The new `range_threshold_bf16` is different: it selects every feature whose range is at least `--bf16_range_threshold` times its own module median, so its BF16 count and theoretical bits/value emerge from the semantic threshold. `matched_low_range_bf16` is an equal-count negative control that protects the globally smallest normalized ranges.
+
+These are numerical single-GPU simulations: they do not pack payloads, perform NCCL communication, or measure transport speed. Average bits/value is theoretical communicated payload size excluding metadata and packing overhead.
+
+```bash
+# Run separately for thresholds 1.0, 1.2, 1.3, 2.0, or 4.0; use distinct outputs.
+PYTHONPATH=src python scripts/eval_lm_harness.py --modes range_threshold_bf16 \
+  --bf16_range_threshold 2.0 --calibration_path calibration-mistral-nemo-tp8.pt \
+  --output_path results/range-threshold-2.0.json
+
+PYTHONPATH=src python scripts/eval_lm_harness.py --modes matched_low_range_bf16 \
+  --bf16_range_threshold 2.0 --calibration_path calibration-mistral-nemo-tp8.pt \
+  --output_path results/matched-low-2.0.json
+```

@@ -11,6 +11,8 @@ from torch import Tensor
 # canonical spelling for the experimental mode.  It deliberately has no Int8
 # counterpart: selected channels are restored with the normal BF16 + Int4 path.
 THRESHOLD_BF16_MODE = "threshold_bf16"
+RANGE_THRESHOLD_BF16_MODE = "range_threshold_bf16"
+MATCHED_LOW_RANGE_BF16_MODE = "matched_low_range_bf16"
 
 @dataclass(slots=True)
 class QuantizedTensor:

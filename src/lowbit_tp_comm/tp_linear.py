@@ -11,6 +11,7 @@ from .quantization import hybrid_quant_dequant, multi_tier_quant_dequant
 # ``threshold_bf16`` uses HybridQuantizedRowParallel{Linear,Conv1D} directly.
 # No extra layer class or Int8 buffers are needed because the reconstruction is
 # exactly the existing selected-BF16 + Int4 reconstruction.
+# The explicit range-threshold modes use these same classes too.
 
 try:
     from transformers.pytorch_utils import Conv1D

@@ -4,7 +4,7 @@ import torch
 import pytest
 from torch import nn
 
-from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, derive_threshold_bf16_selection
+from lowbit_tp_comm.hooks import build_hybrid_replacements_from_calibration, derive_range_threshold_bf16_selection, derive_threshold_bf16_selection, range_threshold_bf16_result_metadata
 from lowbit_tp_comm.quantization import hybrid_quant_dequant
 from lowbit_tp_comm.tp_linear import HybridQuantizedRowParallelLinear
 
@@ -102,3 +102,52 @@ def test_selected_bf16_behavior_is_unchanged() -> None:
     model = TinyTargets()
     replacement = build_hybrid_replacements_from_calibration(model, _calibration(), "selected_bf16", 2)["a_proj"]
     assert torch.equal(replacement.bf16_feature_indices, torch.tensor([0, 1]))
+
+
+def test_explicit_high_threshold_is_inclusive_and_variable() -> None:
+    selection = derive_range_threshold_bf16_selection(_calibration(), threshold=2.0, mode="range_threshold_bf16")
+    assert selection["bf16_feature_count"] == 4
+    assert selection["indices_by_module"]["a_proj"].tolist() == [3, 4, 5]
+    assert selection["indices_by_module"]["b_proj"].tolist() == [5]
+    assert selection["per_module"]["a_proj"]["bf16_count"] != selection["per_module"]["b_proj"]["bf16_count"]
+
+
+def test_threshold_one_selects_at_or_above_module_median() -> None:
+    selection = derive_range_threshold_bf16_selection(_calibration(), threshold=1.0, mode="range_threshold_bf16")
+    assert selection["bf16_feature_count"] == 12
+    assert selection["average_bits_per_value"] == 16.0
+
+
+@pytest.mark.parametrize("threshold, expected", [(1.2, 4), (1.3, 4), (2.0, 4), (4.0, 2)])
+def test_explicit_threshold_counts_and_bits(threshold: float, expected: int) -> None:
+    selection = derive_range_threshold_bf16_selection(_calibration(), threshold=threshold, mode="range_threshold_bf16")
+    assert selection["bf16_feature_count"] == expected
+    assert selection["int4_feature_count"] + expected == selection["total_feature_count"]
+    assert selection["average_bits_per_value"] == 16 * selection["global_bf16_fraction"] + 4 * selection["global_int4_fraction"]
+
+
+def test_matched_low_range_has_equal_budget_and_global_lowest_ties() -> None:
+    high = derive_range_threshold_bf16_selection(_calibration(), threshold=2.0, mode="range_threshold_bf16")
+    low = derive_range_threshold_bf16_selection(_calibration(), threshold=2.0, mode="matched_low_range_bf16")
+    assert low["bf16_feature_count"] == low["matched_high_range_count"] == high["bf16_feature_count"]
+    assert low["average_bits_per_value"] == high["average_bits_per_value"]
+    assert low["indices_by_module"]["a_proj"].tolist() == [0, 1, 2]
+    assert low["indices_by_module"]["b_proj"].tolist() == [0]
+
+
+def test_explicit_modes_reuse_two_tier_and_validate_threshold() -> None:
+    model = TinyTargets()
+    replacement = build_hybrid_replacements_from_calibration(model, _calibration(), "range_threshold_bf16", 2, bf16_range_threshold=2.0)["a_proj"]
+    assert not hasattr(replacement, "int8_feature_indices")
+    with pytest.raises(ValueError, match="finite and positive"):
+        derive_range_threshold_bf16_selection(_calibration(), threshold=float("nan"), mode="range_threshold_bf16")
+    with pytest.raises(ValueError, match="finite and positive"):
+        derive_range_threshold_bf16_selection(_calibration(), threshold=0.0, mode="matched_low_range_bf16")
+
+
+def test_explicit_metadata_invariants() -> None:
+    selection = derive_range_threshold_bf16_selection(_calibration(), threshold=2.0, mode="matched_low_range_bf16")
+    metadata = range_threshold_bf16_result_metadata(selection, calibration_path="fixture.pt", calibration_sha256="abc")
+    assert sum(metadata["per_module_bf16_counts"].values()) == metadata["bf16_feature_count"]
+    assert metadata["bf16_feature_count"] == metadata["matched_high_range_count"]
+    assert metadata["global_bf16_fraction"] == metadata["bf16_feature_count"] / metadata["total_feature_count"]

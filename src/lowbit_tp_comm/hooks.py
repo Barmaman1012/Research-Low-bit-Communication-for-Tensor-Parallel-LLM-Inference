@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.utils.hooks import RemovableHandle
 
 from .calibration import EMAMinMaxCalibrator
-from .quantization import THRESHOLD_BF16_MODE
+from .quantization import MATCHED_LOW_RANGE_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, THRESHOLD_BF16_MODE
 from .tp_linear import (
     HybridQuantizedRowParallelConv1D,
     HybridQuantizedRowParallelLinear,
@@ -367,6 +367,75 @@ def threshold_bf16_result_metadata(
     }
 
 
+def _threshold_entries(calibration: dict[str, Any], model: nn.Module | None) -> tuple[list[tuple[float, str, int]], dict[str, int]]:
+    """Validate calibrated targets and return normalized feature scores once."""
+    modules = calibration.get("modules")
+    if not isinstance(modules, dict) or not modules:
+        raise ValueError("Range-threshold modes require a non-empty calibration 'modules' mapping.")
+    named = dict(model.named_modules()) if model is not None else {}
+    entries: list[tuple[float, str, int]] = []
+    dimensions: dict[str, int] = {}
+    for name in sorted(modules):
+        payload = modules[name]
+        if model is not None and name not in named:
+            raise ValueError(f"Calibrated target module {name!r} is not present in the model.")
+        dim = int(payload["feature_dim"]); values = payload.get("aggregated_ranges")
+        if not isinstance(values, Tensor) or values.ndim != 1 or values.numel() != dim:
+            raise ValueError(f"aggregated_ranges for {name!r} must have shape [{dim}].")
+        if model is not None and _module_feature_dim_for_threshold(named[name]) != dim:
+            raise ValueError(f"Calibration feature dimension mismatch for {name!r}.")
+        values = values.detach().to(device="cpu", dtype=torch.float32)
+        if not torch.isfinite(values).all():
+            raise ValueError(f"aggregated_ranges for {name!r} must be finite.")
+        median = values.median()
+        if not torch.isfinite(median) or median.item() <= 0:
+            raise ValueError(f"aggregated_ranges median for {name!r} must be finite and positive.")
+        normalized = values / median
+        entries.extend((float(score), name, index) for index, score in enumerate(normalized.tolist()))
+        dimensions[name] = dim
+    return entries, dimensions
+
+
+def derive_range_threshold_bf16_selection(
+    calibration: dict[str, Any], *, threshold: float, mode: str, model: nn.Module | None = None,
+) -> dict[str, Any]:
+    """Construct semantic high-range or matched-low BF16 indices once."""
+    if mode not in {RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
+        raise ValueError(f"Unsupported range-threshold mode: {mode}.")
+    if threshold is None or not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("bf16_range_threshold must be finite and positive.")
+    entries, dimensions = _threshold_entries(calibration, model)
+    high = [entry for entry in entries if entry[0] >= threshold]
+    if mode == RANGE_THRESHOLD_BF16_MODE:
+        selected = high; direction = "high_range"; operator = ">="; tie = "module-local inclusive >= threshold"
+    else:
+        selected = sorted(entries, key=lambda item: (item[0], item[1], item[2]))[:len(high)]
+        direction = "low_range"; operator = "matched globally smallest"; tie = "normalized_score_asc,module_name_asc,feature_index_asc"
+    indices = {name: [] for name in dimensions}
+    for _score, name, index in selected: indices[name].append(index)
+    per_module = {name: {"bf16_count": len(indices[name]), "bf16_fraction": len(indices[name]) / dimensions[name], "feature_dim": dimensions[name]} for name in sorted(dimensions)}
+    total = len(entries); count = len(selected)
+    return {"mode": mode, "selection_direction": direction, "normalization_method": "module_median",
+            "supplied_threshold": threshold, "comparison_operator": operator, "total_feature_count": total,
+            "bf16_feature_count": count, "int4_feature_count": total - count,
+            "global_bf16_fraction": count / total, "global_int4_fraction": (total-count) / total,
+            "average_bits_per_value": 4.0 + 12.0 * count / total, "per_module": per_module,
+            "minimum_module_count": min(row["bf16_count"] for row in per_module.values()),
+            "median_module_count": float(torch.tensor([row["bf16_count"] for row in per_module.values()]).median()),
+            "maximum_module_count": max(row["bf16_count"] for row in per_module.values()),
+            "deterministic_tie_breaking": tie, "matched_high_range_count": len(high) if mode == MATCHED_LOW_RANGE_BF16_MODE else None,
+            "indices_by_module": {name: torch.tensor(values, dtype=torch.long) for name, values in indices.items()}}
+
+
+def range_threshold_bf16_result_metadata(selection: dict[str, Any], *, calibration_path: str | None, calibration_sha256: str | None) -> dict[str, Any]:
+    """Serialize the exact explicit-threshold allocation used by replacements."""
+    per_module = selection["per_module"]
+    return {key: selection[key] for key in ("mode", "selection_direction", "normalization_method", "supplied_threshold", "comparison_operator", "total_feature_count", "bf16_feature_count", "int4_feature_count", "global_bf16_fraction", "global_int4_fraction", "average_bits_per_value", "minimum_module_count", "median_module_count", "maximum_module_count", "deterministic_tie_breaking", "matched_high_range_count")} | {
+        "per_module_bf16_counts": {name: int(row["bf16_count"]) for name, row in per_module.items()},
+        "per_module_bf16_fractions": {name: float(row["bf16_fraction"]) for name, row in per_module.items()},
+        "calibration_path": calibration_path, "calibration_sha256": calibration_sha256}
+
+
 def _module_feature_dim_for_threshold(module: nn.Module) -> int:
     if isinstance(module, nn.Linear):
         return int(module.out_features)
@@ -383,22 +452,24 @@ def build_hybrid_replacements_from_calibration(
     num_bits: int = 4,
     seed: int = 0,
     int8_fraction: float = 0.015625,
+    bf16_range_threshold: float | None = None,
 ) -> dict[str, nn.Module]:
     """Construct simulated row-parallel module replacements from calibration results."""
 
     if mode == "full":
         return {}
-    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", THRESHOLD_BF16_MODE, "selected_bf16_int8", "selected_bf16_random_int8"}:
+    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", THRESHOLD_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE, "selected_bf16_int8", "selected_bf16_random_int8"}:
         raise ValueError(f"Unsupported mode: {mode}.")
     if not 0.0 <= int8_fraction <= 1.0:
         raise ValueError("int8_fraction must be in [0, 1].")
 
     threshold_selection = derive_threshold_bf16_selection(calibration, model=model) if mode == THRESHOLD_BF16_MODE else None
+    range_selection = derive_range_threshold_bf16_selection(calibration, threshold=bf16_range_threshold, mode=mode, model=model) if mode in {RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE} else None
     replacements: dict[str, nn.Module] = {}
     named_modules = dict(model.named_modules())
     for module_name, module_payload in calibration["modules"].items():
         if module_name not in named_modules:
-            if mode == THRESHOLD_BF16_MODE:
+            if mode in {THRESHOLD_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
                 raise ValueError(f"Calibrated target module {module_name!r} is not present in the model.")
             continue
         original_module = named_modules[module_name]
@@ -434,6 +505,9 @@ def build_hybrid_replacements_from_calibration(
         elif mode == THRESHOLD_BF16_MODE:
             assert threshold_selection is not None
             bf16_indices = threshold_selection["indices_by_module"][module_name]
+        elif mode in {RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
+            assert range_selection is not None
+            bf16_indices = range_selection["indices_by_module"][module_name]
         elif mode in {"selected_bf16_int8", "selected_bf16_random_int8"}:
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
         else:
@@ -508,4 +582,7 @@ def build_hybrid_replacements_from_calibration(
         # It is ordinary Python provenance, not a buffer or a forward-path tier.
         for replacement in replacements.values():
             replacement.threshold_bf16_allocation = threshold_selection
+    if range_selection is not None:
+        for replacement in replacements.values():
+            replacement.range_threshold_bf16_allocation = range_selection
     return replacements

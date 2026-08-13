@@ -20,9 +20,11 @@ if str(SRC) not in sys.path:
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
     derive_threshold_bf16_selection,
+    derive_range_threshold_bf16_selection,
     list_candidate_sync_modules,
     replace_modules_by_name,
     threshold_bf16_result_metadata,
+    range_threshold_bf16_result_metadata,
 )
 from lowbit_tp_comm.dtypes import (
     DTYPE_CHOICES,
@@ -33,7 +35,8 @@ from lowbit_tp_comm.dtypes import (
     validate_module_devices_and_dtypes,
 )
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
+RANGE_MODES = {"range_threshold_bf16", "matched_low_range_bf16"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_style", choices=["auto", "gpt2", "llama"], default="auto")
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--int8_fraction", type=float, default=0.015625)
+    parser.add_argument("--bf16_range_threshold", type=float, default=None)
     return parser.parse_args()
 
 
@@ -95,6 +99,14 @@ def parse_modes(mode: str, modes: str | None) -> list[str]:
     return parsed
 
 
+def validate_range_threshold_argument(modes: list[str], threshold: float | None) -> None:
+    requires = any(mode in RANGE_MODES for mode in modes)
+    if requires and (threshold is None or not math.isfinite(threshold) or threshold <= 0):
+        raise ValueError("--bf16_range_threshold must be finite and positive for range-threshold modes.")
+    if not requires and threshold is not None:
+        raise ValueError("--bf16_range_threshold is valid only with range_threshold_bf16 or matched_low_range_bf16.")
+
+
 def dtype_bits(dtype: torch.dtype) -> int:
     if dtype in {torch.float16, torch.bfloat16}:
         return 16
@@ -116,6 +128,7 @@ def compute_bits_summary(
     num_bits: int = 4,
     selected_feature_dtype: torch.dtype = torch.bfloat16,
     int8_fraction: float = 0.015625,
+    bf16_range_threshold: float | None = None,
 ) -> tuple[float, list[dict[str, float | int | str]]]:
     if mode == "full":
         return 16.0, []
@@ -129,10 +142,13 @@ def compute_bits_summary(
         raise ValueError("Calibration payload is required for hybrid modes.")
 
     threshold_selection = derive_threshold_bf16_selection(calibration) if mode == "threshold_bf16" else None
+    range_selection = (derive_range_threshold_bf16_selection(calibration, threshold=bf16_range_threshold, mode=mode)
+                       if mode in RANGE_MODES else None)
     module_rows: list[dict[str, float | int | str]] = []
     for module_name, module_payload in calibration["modules"].items():
         feature_dim = int(module_payload["feature_dim"])
-        k = int(threshold_selection["per_module"][module_name]["bf16_count"]) if threshold_selection else int(module_payload["k"])
+        selection = threshold_selection or range_selection
+        k = int(selection["per_module"][module_name]["bf16_count"]) if selection else int(module_payload["k"])
         k_int8 = math.floor(feature_dim * int8_fraction) if mode in {"selected_bf16_int8", "selected_bf16_random_int8"} else 0
         if k + k_int8 > feature_dim:
             raise ValueError("BF16 and Int8 feature counts exceed feature dimension.")
@@ -197,7 +213,7 @@ def build_model_for_mode(
         }
         # Threshold selection is global over every artifact target.  Keep the
         # full mapping so the replacement builder can reject missing targets.
-        calibration = {**calibration, "modules": calibration["modules"] if mode == "threshold_bf16" else filtered_modules}
+        calibration = {**calibration, "modules": calibration["modules"] if mode in {"threshold_bf16", *RANGE_MODES} else filtered_modules}
         replacements = build_hybrid_replacements_from_calibration(
             model,
             calibration=calibration,
@@ -206,6 +222,7 @@ def build_model_for_mode(
             num_bits=num_bits,
             seed=seed,
             int8_fraction=int8_fraction,
+            bf16_range_threshold=bf16_range_threshold,
         )
         replace_modules_by_name(model, replacements)
 
@@ -243,6 +260,7 @@ def evaluate_mode(
     num_bits: int,
     dtype_name: str = "auto",
     int8_fraction: float = 0.015625,
+    bf16_range_threshold: float | None = None,
 ) -> dict[str, Any]:
     model, calibration = build_model_for_mode(
         model_name=model_name,
@@ -255,11 +273,12 @@ def evaluate_mode(
         num_bits=num_bits,
         dtype_name=dtype_name,
         int8_fraction=int8_fraction,
+        bf16_range_threshold=bf16_range_threshold,
     )
     model_device = next(model.parameters()).device
     model_dtype = next(model.parameters()).dtype
     avg_bits, module_rows = compute_bits_summary(
-        mode, calibration, num_bits=num_bits, selected_feature_dtype=model_dtype, int8_fraction=int8_fraction
+        mode, calibration, num_bits=num_bits, selected_feature_dtype=model_dtype, int8_fraction=int8_fraction, bf16_range_threshold=bf16_range_threshold
     )
 
     if verbose_bits and module_rows:
@@ -312,6 +331,11 @@ def evaluate_mode(
             calibration_path=calibration_path,
             calibration_sha256=hashlib.sha256(Path(calibration_path).read_bytes()).hexdigest(),
         )
+    if mode in RANGE_MODES:
+        selection = next((module.range_threshold_bf16_allocation for module in model.modules() if hasattr(module, "range_threshold_bf16_allocation")), None)
+        if selection is None:
+            raise RuntimeError("Range-threshold replacements are missing construction-time allocation metadata.")
+        result[mode] = range_threshold_bf16_result_metadata(selection, calibration_path=calibration_path, calibration_sha256=hashlib.sha256(Path(calibration_path).read_bytes()).hexdigest())
     return result
 
 
@@ -349,6 +373,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     modes = parse_modes(args.mode, args.modes)
+    validate_range_threshold_argument(modes, args.bf16_range_threshold)
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -380,6 +405,7 @@ def main() -> None:
             num_bits=args.num_bits,
             dtype_name=args.dtype,
             int8_fraction=args.int8_fraction,
+            bf16_range_threshold=args.bf16_range_threshold,
         )
         for mode in modes
     ]

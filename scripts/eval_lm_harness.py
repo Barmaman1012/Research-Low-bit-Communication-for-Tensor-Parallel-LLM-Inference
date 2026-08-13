@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import inspect
 import json
+import math
 import platform
 import statistics
 import subprocess
@@ -28,6 +29,7 @@ if str(SRC) not in sys.path:
 
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
+    range_threshold_bf16_result_metadata,
     replace_modules_by_name,
     threshold_bf16_result_metadata,
 )
@@ -46,7 +48,8 @@ try:
 except ImportError:  # pragma: no cover
     Conv1D = None
 
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", "selected_bf16_int8", "selected_bf16_random_int8"}
+RANGE_MODES = {"range_threshold_bf16", "matched_low_range_bf16"}
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"]
 
 
@@ -74,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", default="1")
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--bf16_range_threshold", type=float, default=None)
     return parser.parse_args()
 
 
@@ -92,6 +96,14 @@ def parse_modes(mode: str, modes: str | None) -> list[str]:
     if invalid:
         raise ValueError(f"Unsupported modes in --modes: {invalid}")
     return parsed
+
+
+def validate_range_threshold_argument(modes: list[str], threshold: float | None) -> None:
+    requires = any(mode in RANGE_MODES for mode in modes)
+    if requires and (threshold is None or not math.isfinite(threshold) or threshold <= 0):
+        raise ValueError("--bf16_range_threshold must be finite and positive for range-threshold modes.")
+    if not requires and threshold is not None:
+        raise ValueError("--bf16_range_threshold is valid only with range_threshold_bf16 or matched_low_range_bf16.")
 
 
 def safe_import_lm_eval():
@@ -241,6 +253,7 @@ def build_model_for_mode(
     dtype_name: str = "auto",
     model_revision: str | None = None,
     int8_fraction: float = 0.015625,
+    bf16_range_threshold: float | None = None,
 ):
     model = load_model_or_raise(model_name, device, dtype_name, model_revision)
     calibration = None
@@ -263,6 +276,7 @@ def build_model_for_mode(
             num_bits=num_bits,
             seed=seed,
             int8_fraction=int8_fraction,
+            bf16_range_threshold=bf16_range_threshold,
         )
         replace_modules_by_name(model, replacements)
         # Replacements include calibration buffers loaded from CPU.  Move the
@@ -376,6 +390,11 @@ def build_run_metadata(
             calibration_path=args.calibration_path,
             calibration_sha256=_sha256_file(args.calibration_path),
         )
+    if effective_mode in RANGE_MODES:
+        selection = next((module.range_threshold_bf16_allocation for module in model.modules() if hasattr(module, "range_threshold_bf16_allocation")), None)
+        if selection is None:
+            raise RuntimeError("Range-threshold replacements are missing construction-time allocation metadata.")
+        metadata[effective_mode] = range_threshold_bf16_result_metadata(selection, calibration_path=args.calibration_path, calibration_sha256=_sha256_file(args.calibration_path))
     replacement_metadata: dict[str, Any] = {}
     for name, module in model.named_modules():
         if hasattr(module, "output_dtype") and hasattr(module, "scales_per_partition"):
@@ -498,6 +517,7 @@ def main() -> None:
     tokenizer = load_tokenizer_or_raise(args.model_name, args.tokenizer_revision)
     tasks = parse_csv_list(args.tasks, default=DEFAULT_TASKS)
     modes = parse_modes(args.mode, args.modes)
+    validate_range_threshold_argument(modes, args.bf16_range_threshold)
 
     all_rows: list[dict[str, Any]] = []
     raw_results: dict[str, Any] = {}
@@ -514,6 +534,7 @@ def main() -> None:
             dtype_name=args.dtype,
             model_revision=args.model_revision,
             int8_fraction=args.int8_fraction,
+            bf16_range_threshold=args.bf16_range_threshold,
         )
         lm = HFLM(
             pretrained=model,
