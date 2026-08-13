@@ -1,0 +1,19 @@
+{
+  "calibration_path": "outputs/calibration-mistral-nemo-tp8-random-chunks-seed0-len128.pt",
+  "calibration_sha256": "39f2bc63058a9411ce586a8dd1b11383ea9351d3cccdf7b3fe3fc1c732c8f740",
+  "model_revision": "a4477a2f977929a969745b69bbd62e03043551a5",
+  "tokenizer_revision": "a4477a2f977929a969745b69bbd62e03043551a5",
+  "calibration_parameters": {
+    "gamma": 0.01,
+    "k_fraction": 0.015625,
+    "num_sequences": 256,
+    "sequence_length": 128,
+    "num_partitions": 8,
+    "sampling_strategy": "random_token_chunks",
+    "seed": null
+  },
+  "source_git_commit": "9ec9bffd8771824114ce213a832056ac35542527",
+  "analysis_git_commit": "ac6614be44e61a43a0f4722cb4850cfd9962ce8a",
+  "python_version": "3.10.20",
+  "torch_version": "2.13.0+cu126"
+}
