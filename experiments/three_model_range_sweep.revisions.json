@@ -1,0 +1,17 @@
+{
+  "gemma2_27b": {
+    "model_id": "google/gemma-2-27b",
+    "model_revision": "938270f5272feb02779b55c2bb2fffdd0f53ff0c",
+    "tokenizer_revision": "938270f5272feb02779b55c2bb2fffdd0f53ff0c"
+  },
+  "llama2_13b": {
+    "model_id": "meta-llama/Llama-2-13b-hf",
+    "model_revision": "5c31dfb671ce7cfe2d7bb7c04375e44c55e815b1",
+    "tokenizer_revision": "5c31dfb671ce7cfe2d7bb7c04375e44c55e815b1"
+  },
+  "mistral_nemo_12b": {
+    "model_id": "mistralai/Mistral-Nemo-Base-2407",
+    "model_revision": "a4477a2f977929a969745b69bbd62e03043551a5",
+    "tokenizer_revision": "a4477a2f977929a969745b69bbd62e03043551a5"
+  }
+}
