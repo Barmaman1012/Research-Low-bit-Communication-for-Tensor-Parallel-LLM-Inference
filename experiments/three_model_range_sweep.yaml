@@ -1,0 +1,66 @@
+experiment:
+  name: three_model_range_sweep
+  version: 1
+  git_commit_requirement: "record HEAD at submission; refuse dirty or unresolved revision lock"
+  revision_lock: experiments/three_model_range_sweep.revisions.json
+models:
+  gemma2_27b:
+    model_id: google/gemma-2-27b
+    model_revision: RESOLVE_STAGE_A
+    tokenizer_revision: RESOLVE_STAGE_A
+    target_style: llama
+    num_partitions: 8
+    dtype: bfloat16
+    resources: {gpus: 1, gpu: H100_80GB, cpus: 16, mem_gb: 192, complete_calibration_after_smoke: true}
+  llama2_13b:
+    model_id: meta-llama/Llama-2-13b-hf
+    model_revision: RESOLVE_STAGE_A
+    tokenizer_revision: RESOLVE_STAGE_A
+    target_style: llama
+    num_partitions: 8
+    dtype: bfloat16
+    resources: {gpus: 1, gpu: H100_80GB, cpus: 16, mem_gb: 128}
+  mistral_nemo_12b:
+    model_id: mistralai/Mistral-Nemo-Base-2407
+    model_revision: a4477a2f977929a969745b69bbd62e03043551a5
+    tokenizer_revision: a4477a2f977929a969745b69bbd62e03043551a5
+    target_style: llama
+    num_partitions: 8
+    dtype: bfloat16
+    resources: {gpus: 1, gpu: H100_80GB, cpus: 16, mem_gb: 128}
+calibration:
+  dataset_name: wikitext
+  dataset_config: wikitext-2-raw-v1
+  dataset_revision: b08601e04326c79dfdd32d625aee71d232d685c3
+  split: train
+  sampling_strategy: random_token_chunks
+  sampling_seed: 0
+  num_sequences: 256
+  sequence_length: 128
+  gamma: 0.01
+  k_fraction: 0.015625
+  simulate_row_parallel_calibration: true
+evaluation:
+  tasks: [arc_easy, arc_challenge, winogrande, hellaswag, boolq]
+  smoke_tasks: [arc_easy, boolq]
+  smoke_limit: 2
+  batch_size: 1
+  num_fewshot: 0
+  seed: 0
+modes: [full, int4, random_bf16, selected_bf16]
+range_thresholds: [1.0, 1.2, 1.4, 1.6, 1.8, 1.9, 2.0, 2.1, 2.3]
+outputs:
+  root: outputs/three_model_range_sweep
+  calibration_pattern: "{model}/calibration-{model}-tp8-random_token_chunks-seed0-n256-l128.pt"
+  result_pattern: "{model}/{stage}/{model}-{configuration}-seed0.json"
+  log_pattern: "{model}/logs/{stage}-{configuration}-%j.out"
+expected_provenance:
+  - model_revision
+  - resolved_model_revision
+  - tokenizer_revision
+  - resolved_tokenizer_revision
+  - calibration_sha256
+  - git_commit
+  - random_bf16.global_random_seed
+  - random_bf16.selection_strategy
+  - random_bf16.per_module_selected_index_checksums
