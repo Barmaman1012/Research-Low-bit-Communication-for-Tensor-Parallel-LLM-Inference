@@ -10,6 +10,8 @@ from torch import Tensor
 # Kept here with the two-tier quantization implementation so callers have one
 # canonical spelling for the experimental mode.  It deliberately has no Int8
 # counterpart: selected channels are restored with the normal BF16 + Int4 path.
+GLOBAL_EQUAL_BUDGET_BF16_MODE = "global_equal_budget_bf16"
+# Backward-compatible user-facing alias.  It does not mean an explicit range threshold.
 THRESHOLD_BF16_MODE = "threshold_bf16"
 RANGE_THRESHOLD_BF16_MODE = "range_threshold_bf16"
 MATCHED_LOW_RANGE_BF16_MODE = "matched_low_range_bf16"

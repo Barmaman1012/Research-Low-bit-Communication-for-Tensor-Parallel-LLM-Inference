@@ -301,9 +301,9 @@ PYTHONPATH=src python scripts/eval_lm_harness.py --model_revision a4477a2f977929
 
 ## Experimental global-threshold BF16
 
-`threshold_bf16` is an equal-budget numerical simulation for comparing global
+`global_equal_budget_bf16` is an equal-budget numerical simulation for comparing global
 allocation against the fixed per-module selection. `selected_bf16` preserves
-`E/64` features independently in each module; `threshold_bf16` preserves the
+`E/64` features independently in each module; `global_equal_budget_bf16` preserves the
 same total count across all calibrated modules, ranking each feature by its
 aggregated range divided by that module's median range. It uses BF16 for the
 global winners and the existing Int4 path for every other feature—there is no
@@ -314,12 +314,12 @@ communication.
 PYTHONPATH=src ./.venv/bin/python scripts/eval_lm_harness.py \
   --model_name mistralai/Mistral-Nemo-Instruct-2407 \
   --calibration_path calibration-mistral-nemo-tp8.pt \
-  --target_style llama --mode threshold_bf16 --num_partitions 8
+  --target_style llama --mode global_equal_budget_bf16 --num_partitions 8
 ```
 
 ## Range-threshold experiments
 
-`selected_bf16` keeps the fixed top `E/64` features independently in every module. Existing `threshold_bf16` instead uses the same total selected count globally, ranked by range divided by module median. The new `range_threshold_bf16` is different: it selects every feature whose range is at least `--bf16_range_threshold` times its own module median, so its BF16 count and theoretical bits/value emerge from the semantic threshold. `matched_low_range_bf16` is an equal-count negative control that protects the globally smallest normalized ranges.
+`selected_bf16` keeps the fixed top `E/64` features independently in every module. `global_equal_budget_bf16` instead uses the same total selected count globally, ranked by range divided by module median. The deprecated alias `threshold_bf16` still means this equal-budget method and is not threshold 2.0. `range_threshold_bf16` is the explicit semantic-threshold method: it selects every feature whose range is at least `--bf16_range_threshold` times its own module median, so its BF16 count and theoretical bits/value emerge from the threshold. `matched_low_range_bf16` is an equal-count negative control that protects the globally smallest normalized ranges.
 
 These are numerical single-GPU simulations: they do not pack payloads, perform NCCL communication, or measure transport speed. Average bits/value is theoretical communicated payload size excluding metadata and packing overhead.
 

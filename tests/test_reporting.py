@@ -293,7 +293,7 @@ def test_threshold_bf16_harness_serializes_exact_allocation_metadata(tmp_path: P
     )
     serialized = harness_module.make_json_serializable({"metadata": {"threshold_bf16": metadata}})
     json.loads(json.dumps(serialized))
-    allocation = serialized["metadata"]["threshold_bf16"]["threshold_bf16"]
+    allocation = serialized["metadata"]["threshold_bf16"]["global_equal_budget_bf16"]
     required = {
         "mode", "normalization_method", "total_feature_count", "target_bf16_count", "actual_bf16_count",
         "global_bf16_fraction", "global_int4_fraction", "average_bits_per_value", "derived_threshold",
@@ -301,7 +301,7 @@ def test_threshold_bf16_harness_serializes_exact_allocation_metadata(tmp_path: P
         "per_module_bf16_fractions", "calibration_path", "calibration_sha256",
     }
     assert required <= allocation.keys()
-    assert allocation["mode"] == "threshold_bf16"
+    assert allocation["mode"] == "global_equal_budget_bf16"
     assert allocation["normalization_method"] == "module_median"
     assert sum(allocation["per_module_bf16_counts"].values()) == allocation["actual_bf16_count"]
     assert allocation["actual_bf16_count"] == allocation["target_bf16_count"]

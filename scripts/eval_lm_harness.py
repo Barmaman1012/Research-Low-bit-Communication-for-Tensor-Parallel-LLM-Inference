@@ -29,6 +29,7 @@ if str(SRC) not in sys.path:
 
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
+    canonicalize_mode,
     range_threshold_bf16_result_metadata,
     replace_modules_by_name,
     threshold_bf16_result_metadata,
@@ -49,7 +50,8 @@ except ImportError:  # pragma: no cover
     Conv1D = None
 
 RANGE_MODES = {"range_threshold_bf16", "matched_low_range_bf16"}
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
+GLOBAL_EQUAL_MODE = "global_equal_budget_bf16"
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", GLOBAL_EQUAL_MODE, *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "winogrande", "hellaswag", "boolq"]
 
 
@@ -346,8 +348,9 @@ def build_run_metadata(
     tasks: list[str],
     modes: list[str],
     mode: str | None = None,
+    requested_mode: str | None = None,
 ) -> dict[str, Any]:
-    effective_mode = mode or args.mode
+    effective_mode = canonicalize_mode(mode or args.mode)
     metadata = {
         "model_name": args.model_name,
         "model_revision": getattr(args, "model_revision", None),
@@ -369,6 +372,8 @@ def build_run_metadata(
         "batch_size": args.batch_size,
         "seed": args.seed,
         "mode": effective_mode,
+        "canonical_mode": effective_mode,
+        "requested_mode": requested_mode or mode or args.mode,
         "modes": modes,
         "num_partitions": args.num_partitions,
         "num_bits": args.num_bits,
@@ -378,14 +383,14 @@ def build_run_metadata(
         "git_commit": _git_commit_hash(),
     }
     metadata.update(model_dtype_metadata(model))
-    if effective_mode == "threshold_bf16":
+    if effective_mode == GLOBAL_EQUAL_MODE:
         selection = next(
             (module.threshold_bf16_allocation for module in model.modules() if hasattr(module, "threshold_bf16_allocation")),
             None,
         )
         if selection is None:
             raise RuntimeError("threshold_bf16 replacements are missing construction-time allocation metadata.")
-        metadata["threshold_bf16"] = threshold_bf16_result_metadata(
+        metadata[GLOBAL_EQUAL_MODE] = threshold_bf16_result_metadata(
             selection,
             calibration_path=args.calibration_path,
             calibration_sha256=_sha256_file(args.calibration_path),
@@ -417,6 +422,8 @@ def build_run_metadata(
                     "int4_fraction": (feature_dim - bf16_count - int8_count) / feature_dim,
                     "average_bits_per_value": 4 + 12 * bf16_count / feature_dim + 4 * int8_count / feature_dim,
                 })
+            if hasattr(module, "random_bf16_metadata"):
+                replacement_metadata[name]["random_bf16"] = module.random_bf16_metadata
     metadata["replacement_dtypes"] = replacement_metadata
     return metadata
 
@@ -523,6 +530,8 @@ def main() -> None:
     raw_results: dict[str, Any] = {}
     metadata_by_mode: dict[str, dict[str, Any]] = {}
     for mode in modes:
+        requested_mode = mode
+        mode = canonicalize_mode(requested_mode)
         model, _calibration = build_model_for_mode(
             model_name=args.model_name,
             calibration_path=args.calibration_path,
@@ -562,6 +571,7 @@ def main() -> None:
             tasks=tasks,
             modes=modes,
             mode=mode,
+            requested_mode=requested_mode,
         )
         all_rows.extend(extract_rows(mode, results))
 

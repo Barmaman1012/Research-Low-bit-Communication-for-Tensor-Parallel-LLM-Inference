@@ -26,6 +26,7 @@ from lowbit_tp_comm.dtypes import DTYPE_CHOICES, ensure_dtype_supported, model_l
 from lowbit_tp_comm.hooks import (
     ModuleInputOutputCapture,
     derive_threshold_bf16_selection,
+    canonicalize_mode,
     list_candidate_sync_modules,
     threshold_bf16_result_metadata,
     derive_range_threshold_bf16_selection,
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_sequences", type=int, default=16)
     parser.add_argument("--sequence_length", type=int, default=128)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16", "threshold_bf16", "range_threshold_bf16", "matched_low_range_bf16", "selected_bf16_int8", "selected_bf16_random_int8"], default="selected_bf16")
+    parser.add_argument("--mode", choices=["int4", "random_bf16", "selected_bf16", "threshold_bf16", "global_equal_budget_bf16", "range_threshold_bf16", "matched_low_range_bf16", "selected_bf16_int8", "selected_bf16_random_int8"], default="selected_bf16")
     parser.add_argument("--top_modules", type=int, default=12)
     parser.add_argument("--num_bits", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
@@ -97,7 +98,7 @@ def choose_selected_indices(module_payload: dict[str, Any], mode: str, seed: int
         return module_payload["topk_indices"].to(dtype=torch.long)
     if mode == "random_bf16":
         return make_random_bf16_indices(feature_dim, k, seed=seed)
-    if mode in {"threshold_bf16", "range_threshold_bf16", "matched_low_range_bf16"}:
+    if mode in {"threshold_bf16", "global_equal_budget_bf16", "range_threshold_bf16", "matched_low_range_bf16"}:
         if threshold_indices is None:
             raise ValueError(f"{mode} selection was not derived.")
         return threshold_indices.to(dtype=torch.long)
@@ -167,6 +168,8 @@ def three_tier_diagnostic_stats(
 
 def main() -> None:
     args = parse_args()
+    requested_mode = args.mode
+    args.mode = canonicalize_mode(requested_mode)
     if args.mode in {"range_threshold_bf16", "matched_low_range_bf16"} and (args.bf16_range_threshold is None or not math.isfinite(args.bf16_range_threshold) or args.bf16_range_threshold <= 0):
         raise ValueError("--bf16_range_threshold must be finite and positive for range-threshold modes.")
     if args.mode not in {"range_threshold_bf16", "matched_low_range_bf16"} and args.bf16_range_threshold is not None:
@@ -198,7 +201,7 @@ def main() -> None:
     validate_module_devices_and_dtypes(model, device, requested_dtype)
 
     threshold_selection = (
-        derive_threshold_bf16_selection(calibration, model=model) if args.mode == "threshold_bf16" else None
+        derive_threshold_bf16_selection(calibration, model=model) if args.mode == "global_equal_budget_bf16" else None
     )
     range_selection = (derive_range_threshold_bf16_selection(calibration, threshold=args.bf16_range_threshold, mode=args.mode, model=model)
                        if args.mode in {"range_threshold_bf16", "matched_low_range_bf16"} else None)
@@ -294,7 +297,8 @@ def main() -> None:
     except (OSError, subprocess.CalledProcessError):
         git_commit = None
     output: dict[str, Any] = {"provenance": {
-        "mode": args.mode, "calibration_path": args.calibration_path, "int8_fraction": args.int8_fraction,
+        "mode": args.mode, "canonical_mode": args.mode, "requested_mode": requested_mode,
+        "calibration_path": args.calibration_path, "int8_fraction": args.int8_fraction,
         "model_name": args.model_name, "model_revision": args.model_revision,
         "tokenizer_revision": args.tokenizer_revision, "dataset_revision": args.dataset_revision,
         "sampling_strategy": args.sampling_strategy, "sampling_seed": args.seed,
@@ -307,7 +311,7 @@ def main() -> None:
         "calibration_sha256": calibration_sha256, "git_commit": git_commit,
     }, "modules": {}}
     if threshold_selection is not None:
-        output["provenance"]["threshold_bf16"] = threshold_bf16_result_metadata(
+        output["provenance"]["global_equal_budget_bf16"] = threshold_bf16_result_metadata(
             threshold_selection,
             calibration_path=args.calibration_path,
             calibration_sha256=calibration_sha256,

@@ -50,6 +50,7 @@ def make_random_bf16_indices(
     k: int,
     seed: int = 0,
     device: torch.device | str | None = None,
+    generator: torch.Generator | None = None,
 ) -> Tensor:
     """Choose k random output-feature indices without replacement."""
 
@@ -59,9 +60,8 @@ def make_random_bf16_indices(
         return torch.empty(0, dtype=torch.long, device=device)
 
     clamped_k = min(k, feature_dim)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    return torch.randperm(feature_dim, generator=generator)[:clamped_k].to(device=device)
+    resolved_generator = generator or torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randperm(feature_dim, generator=resolved_generator, device="cpu")[:clamped_k].to(device=device)
 
 
 def compute_row_parallel_partials_for_module(

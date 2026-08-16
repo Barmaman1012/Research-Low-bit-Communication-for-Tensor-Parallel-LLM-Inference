@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 
 from lowbit_tp_comm.hooks import (
     build_hybrid_replacements_from_calibration,
+    canonicalize_mode,
     derive_threshold_bf16_selection,
     derive_range_threshold_bf16_selection,
     list_candidate_sync_modules,
@@ -36,7 +37,8 @@ from lowbit_tp_comm.dtypes import (
 )
 
 RANGE_MODES = {"range_threshold_bf16", "matched_low_range_bf16"}
-VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
+GLOBAL_EQUAL_MODE = "global_equal_budget_bf16"
+VALID_MODES = {"full", "tp_uncompressed", "all_bf16", "int4", "random_bf16", "selected_bf16", "threshold_bf16", GLOBAL_EQUAL_MODE, *RANGE_MODES, "selected_bf16_int8", "selected_bf16_random_int8"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,7 +143,7 @@ def compute_bits_summary(
     if calibration is None:
         raise ValueError("Calibration payload is required for hybrid modes.")
 
-    threshold_selection = derive_threshold_bf16_selection(calibration) if mode == "threshold_bf16" else None
+    threshold_selection = derive_threshold_bf16_selection(calibration) if mode == GLOBAL_EQUAL_MODE else None
     range_selection = (derive_range_threshold_bf16_selection(calibration, threshold=bf16_range_threshold, mode=mode)
                        if mode in RANGE_MODES else None)
     module_rows: list[dict[str, float | int | str]] = []
@@ -213,7 +215,7 @@ def build_model_for_mode(
         }
         # Threshold selection is global over every artifact target.  Keep the
         # full mapping so the replacement builder can reject missing targets.
-        calibration = {**calibration, "modules": calibration["modules"] if mode in {"threshold_bf16", *RANGE_MODES} else filtered_modules}
+        calibration = {**calibration, "modules": calibration["modules"] if mode in {GLOBAL_EQUAL_MODE, *RANGE_MODES} else filtered_modules}
         replacements = build_hybrid_replacements_from_calibration(
             model,
             calibration=calibration,
@@ -262,6 +264,8 @@ def evaluate_mode(
     int8_fraction: float = 0.015625,
     bf16_range_threshold: float | None = None,
 ) -> dict[str, Any]:
+    requested_mode = mode
+    mode = canonicalize_mode(mode)
     model, calibration = build_model_for_mode(
         model_name=model_name,
         mode=mode,
@@ -309,6 +313,8 @@ def evaluate_mode(
     perplexity = math.exp(avg_loss)
     result: dict[str, Any] = {
         "mode": mode,
+        "canonical_mode": mode,
+        "requested_mode": requested_mode,
         "avg_loss": avg_loss,
         "perplexity": perplexity,
         "avg_bits_per_value": avg_bits,
@@ -319,14 +325,14 @@ def evaluate_mode(
             if mode == "selected_bf16_random_int8" else None
         ),
     }
-    if mode == "threshold_bf16":
+    if mode == GLOBAL_EQUAL_MODE:
         selection = next(
             (module.threshold_bf16_allocation for module in model.modules() if hasattr(module, "threshold_bf16_allocation")),
             None,
         )
         if selection is None:
             raise RuntimeError("threshold_bf16 replacements are missing construction-time allocation metadata.")
-        result["threshold_bf16"] = threshold_bf16_result_metadata(
+        result[GLOBAL_EQUAL_MODE] = threshold_bf16_result_metadata(
             selection,
             calibration_path=calibration_path,
             calibration_sha256=hashlib.sha256(Path(calibration_path).read_bytes()).hexdigest(),

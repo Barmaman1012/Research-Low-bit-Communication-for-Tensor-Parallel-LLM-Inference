@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 import math
+import warnings
 from typing import Any, Literal, Protocol, Sequence
 
 import torch
@@ -10,7 +11,7 @@ from torch import Tensor, nn
 from torch.utils.hooks import RemovableHandle
 
 from .calibration import EMAMinMaxCalibrator
-from .quantization import MATCHED_LOW_RANGE_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, THRESHOLD_BF16_MODE
+from .quantization import GLOBAL_EQUAL_BUDGET_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, THRESHOLD_BF16_MODE
 from .tp_linear import (
     HybridQuantizedRowParallelConv1D,
     HybridQuantizedRowParallelLinear,
@@ -241,6 +242,20 @@ def replace_modules_by_name(model: nn.Module, replacements: dict[str, nn.Module]
         _set_child_module(parent_module, child_name, replacement)
 
 
+def canonicalize_mode(mode: str, *, warn_on_alias: bool = True) -> str:
+    """Map the deprecated equal-budget alias to its unambiguous canonical name."""
+    if mode == THRESHOLD_BF16_MODE:
+        if warn_on_alias:
+            warnings.warn(
+                "threshold_bf16 is deprecated and means global_equal_budget_bf16; "
+                "it is not the explicit range-threshold method. Use range_threshold_bf16 for --bf16_range_threshold.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return GLOBAL_EQUAL_BUDGET_BF16_MODE
+    return mode
+
+
 def derive_threshold_bf16_selection(
     calibration: dict[str, Any],
     *,
@@ -318,7 +333,7 @@ def derive_threshold_bf16_selection(
     }
     total_features = len(entries)
     return {
-        "mode": THRESHOLD_BF16_MODE,
+        "mode": GLOBAL_EQUAL_BUDGET_BF16_MODE,
         "normalization_method": "module_median",
         "total_feature_count": total_features,
         "target_bf16_count": target_count,
@@ -348,7 +363,9 @@ def threshold_bf16_result_metadata(
     counts = {name: int(details["bf16_count"]) for name, details in per_module.items()}
     fractions = {name: float(details["bf16_fraction"]) for name, details in per_module.items()}
     return {
-        "mode": THRESHOLD_BF16_MODE,
+        "mode": GLOBAL_EQUAL_BUDGET_BF16_MODE,
+        "selection_rule": "globally largest normalized ranges at fixed selected-BF16 budget",
+        "supplied_threshold": None,
         "normalization_method": selection["normalization_method"],
         "total_feature_count": int(selection["total_feature_count"]),
         "target_bf16_count": int(selection["target_bf16_count"]),
@@ -430,7 +447,7 @@ def derive_range_threshold_bf16_selection(
 def range_threshold_bf16_result_metadata(selection: dict[str, Any], *, calibration_path: str | None, calibration_sha256: str | None) -> dict[str, Any]:
     """Serialize the exact explicit-threshold allocation used by replacements."""
     per_module = selection["per_module"]
-    return {key: selection[key] for key in ("mode", "selection_direction", "normalization_method", "supplied_threshold", "comparison_operator", "total_feature_count", "bf16_feature_count", "int4_feature_count", "global_bf16_fraction", "global_int4_fraction", "average_bits_per_value", "minimum_module_count", "median_module_count", "maximum_module_count", "deterministic_tie_breaking", "matched_high_range_count")} | {
+    return {key: selection[key] for key in ("mode", "selection_direction", "normalization_method", "supplied_threshold", "comparison_operator", "total_feature_count", "bf16_feature_count", "int4_feature_count", "global_bf16_fraction", "global_int4_fraction", "average_bits_per_value", "minimum_module_count", "median_module_count", "maximum_module_count", "deterministic_tie_breaking", "matched_high_range_count")} | {"selection_rule": "normalized range >= supplied threshold" if selection["selection_direction"] == "high_range" else "globally smallest normalized ranges at matched high-range count",
         "per_module_bf16_counts": {name: int(row["bf16_count"]) for name, row in per_module.items()},
         "per_module_bf16_fractions": {name: float(row["bf16_fraction"]) for name, row in per_module.items()},
         "calibration_path": calibration_path, "calibration_sha256": calibration_sha256}
@@ -456,20 +473,23 @@ def build_hybrid_replacements_from_calibration(
 ) -> dict[str, nn.Module]:
     """Construct simulated row-parallel module replacements from calibration results."""
 
+    mode = canonicalize_mode(mode)
     if mode == "full":
         return {}
-    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", THRESHOLD_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE, "selected_bf16_int8", "selected_bf16_random_int8"}:
+    if mode not in {"tp_uncompressed", "all_bf16", "int4", "selected_bf16", "random_bf16", GLOBAL_EQUAL_BUDGET_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE, "selected_bf16_int8", "selected_bf16_random_int8"}:
         raise ValueError(f"Unsupported mode: {mode}.")
     if not 0.0 <= int8_fraction <= 1.0:
         raise ValueError("int8_fraction must be in [0, 1].")
 
-    threshold_selection = derive_threshold_bf16_selection(calibration, model=model) if mode == THRESHOLD_BF16_MODE else None
+    threshold_selection = derive_threshold_bf16_selection(calibration, model=model) if mode == GLOBAL_EQUAL_BUDGET_BF16_MODE else None
     range_selection = derive_range_threshold_bf16_selection(calibration, threshold=bf16_range_threshold, mode=mode, model=model) if mode in {RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE} else None
+    random_generator = torch.Generator(device="cpu").manual_seed(seed) if mode == "random_bf16" else None
     replacements: dict[str, nn.Module] = {}
     named_modules = dict(model.named_modules())
-    for module_name, module_payload in calibration["modules"].items():
+    for module_name in sorted(calibration["modules"]):
+        module_payload = calibration["modules"][module_name]
         if module_name not in named_modules:
-            if mode in {THRESHOLD_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
+            if mode in {GLOBAL_EQUAL_BUDGET_BF16_MODE, RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
                 raise ValueError(f"Calibrated target module {module_name!r} is not present in the model.")
             continue
         original_module = named_modules[module_name]
@@ -502,7 +522,7 @@ def build_hybrid_replacements_from_calibration(
             bf16_indices = torch.empty(0, dtype=torch.long)
         elif mode == "selected_bf16":
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
-        elif mode == THRESHOLD_BF16_MODE:
+        elif mode == GLOBAL_EQUAL_BUDGET_BF16_MODE:
             assert threshold_selection is not None
             bf16_indices = threshold_selection["indices_by_module"][module_name]
         elif mode in {RANGE_THRESHOLD_BF16_MODE, MATCHED_LOW_RANGE_BF16_MODE}:
@@ -511,7 +531,8 @@ def build_hybrid_replacements_from_calibration(
         elif mode in {"selected_bf16_int8", "selected_bf16_random_int8"}:
             bf16_indices = module_payload["topk_indices"].to(dtype=torch.long)
         else:
-            bf16_indices = make_random_bf16_indices(feature_dim, k, seed=seed)
+            assert random_generator is not None
+            bf16_indices = make_random_bf16_indices(feature_dim, k, generator=random_generator)
 
         is_three_tier = mode in {"selected_bf16_int8", "selected_bf16_random_int8"}
         if is_three_tier:
@@ -582,6 +603,14 @@ def build_hybrid_replacements_from_calibration(
         # It is ordinary Python provenance, not a buffer or a forward-path tier.
         for replacement in replacements.values():
             replacement.threshold_bf16_allocation = threshold_selection
+    if mode == "random_bf16":
+        for name, replacement in replacements.items():
+            replacement.random_bf16_metadata = {
+                "global_random_seed": seed,
+                "selection_strategy": "shared_stateful_generator_per_model",
+                "selected_indices": replacement.bf16_feature_indices.detach().cpu().tolist(),
+                "module_name": name,
+            }
     if range_selection is not None:
         for replacement in replacements.values():
             replacement.range_threshold_bf16_allocation = range_selection

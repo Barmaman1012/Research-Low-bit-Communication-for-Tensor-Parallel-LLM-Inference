@@ -151,3 +151,25 @@ def test_explicit_metadata_invariants() -> None:
     assert sum(metadata["per_module_bf16_counts"].values()) == metadata["bf16_feature_count"]
     assert metadata["bf16_feature_count"] == metadata["matched_high_range_count"]
     assert metadata["global_bf16_fraction"] == metadata["bf16_feature_count"] / metadata["total_feature_count"]
+
+
+def test_random_bf16_uses_shared_reproducible_generator_per_model() -> None:
+    first = build_hybrid_replacements_from_calibration(TinyTargets(), _calibration(), "random_bf16", 2, seed=17)
+    second = build_hybrid_replacements_from_calibration(TinyTargets(), _calibration(), "random_bf16", 2, seed=17)
+    changed = build_hybrid_replacements_from_calibration(TinyTargets(), _calibration(), "random_bf16", 2, seed=18)
+    mapping = {name: replacement.bf16_feature_indices for name, replacement in first.items()}
+    assert not torch.equal(mapping["a_proj"], mapping["b_proj"])
+    for name, indices in mapping.items():
+        assert torch.equal(indices, second[name].bf16_feature_indices)
+        assert indices.numel() == 2 and indices.unique().numel() == 2
+        assert int(indices.min()) >= 0 and int(indices.max()) < 6
+    assert any(not torch.equal(first[name].bf16_feature_indices, changed[name].bf16_feature_indices) for name in first)
+    assert first["a_proj"].random_bf16_metadata["selection_strategy"] == "shared_stateful_generator_per_model"
+
+
+def test_deprecated_threshold_alias_matches_canonical_global_equal_budget() -> None:
+    with pytest.warns(DeprecationWarning):
+        alias = build_hybrid_replacements_from_calibration(TinyTargets(), _calibration(), "threshold_bf16", 2)
+    canonical = build_hybrid_replacements_from_calibration(TinyTargets(), _calibration(), "global_equal_budget_bf16", 2)
+    for name in alias:
+        assert torch.equal(alias[name].bf16_feature_indices, canonical[name].bf16_feature_indices)
