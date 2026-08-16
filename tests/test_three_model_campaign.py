@@ -103,6 +103,24 @@ def test_dry_run_has_no_sbatch_call_or_token_value():
     assert "--export=ALL" in script and token not in script
     assert "sbatch" in script and token not in result.stdout + result.stderr
     assert "DRY-RUN" in result.stdout
+    stage_b_lines = [line for line in result.stdout.splitlines() if "stage=b" in line]
+    assert len(stage_b_lines) == 3
+    for model, memory in (("gemma2_27b", "192G"), ("llama2_13b", "128G"), ("mistral_nemo_12b", "128G")):
+        line = next(line for line in stage_b_lines if model in line)
+        assert f"--mem={memory}" in line and "--export=ALL" in line
+        assert str(ROOT / "experiments" / "three_model_range_sweep.revisions.json") in line
+
+
+def test_submitter_finds_repository_when_started_outside_repository(tmp_path):
+    token = "token-never-in-dry-run"
+    result = subprocess.run(
+        ["bash", str(ROOT / "experiments/slurm/submit_three_model_range_sweep.sh"), "--dry-run", "--stage-only", "b"],
+        cwd=tmp_path, env=dict(os.environ, HF_TOKEN=token, PYTHON_BIN=str(ROOT / ".venv/bin/python")),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0
+    assert str(ROOT / "experiments" / "three_model_range_sweep.revisions.json") in result.stdout
+    assert token not in result.stdout + result.stderr
 
 
 def test_sbatch_scripts_are_real_programs_not_echo_placeholders():
@@ -111,3 +129,38 @@ def test_sbatch_scripts_are_real_programs_not_echo_placeholders():
         assert "run-stage" in text
         assert "echo \"Use scripts" not in text
         assert "set -euo pipefail" in text
+
+
+def test_sbatch_stages_use_submit_dir_not_spooled_bash_source():
+    for path in sorted((ROOT / "experiments" / "slurm").glob("stage_*.sbatch")):
+        text = path.read_text()
+        assert "BASH_SOURCE" not in text
+        assert "ROOT=${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}" in text
+        assert "Invalid campaign repository ROOT=$ROOT" in text
+
+
+def test_spooled_stage_uses_submit_dir_and_reports_missing_venv(tmp_path):
+    spool = tmp_path / "cm/local/apps/slurm/var/spool/job1"; spool.mkdir(parents=True)
+    copied = spool / "slurm_script"
+    copied.write_text((ROOT / "experiments/slurm/stage_b_load_smoke.sbatch").read_text())
+    result = subprocess.run(
+        ["bash", str(copied), "gemma2_27b", str(ROOT / "experiments/three_model_range_sweep.revisions.json")],
+        env=dict(os.environ, SLURM_SUBMIT_DIR=str(ROOT), SLURM_JOB_ID="1", HF_TOKEN="fake"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert f"ROOT={ROOT}" in result.stderr
+    assert str(spool) not in result.stderr
+
+
+def test_stage_rejects_missing_lock_before_activation(tmp_path):
+    repo = tmp_path / "repo"
+    for relative in ("experiments/three_model_range_sweep.yaml", "experiments/three_model_range_sweep.revisions.json", "scripts/three_model_campaign.py", ".venv-gpu310/bin/activate"):
+        path = repo / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("marker")
+    result = subprocess.run(
+        ["bash", str(ROOT / "experiments/slurm/stage_b_load_smoke.sbatch"), "gemma2_27b", str(repo / "missing-lock.json")],
+        env=dict(os.environ, SLURM_SUBMIT_DIR=str(repo), SLURM_JOB_ID="1", HF_TOKEN="fake"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert f"ROOT={repo}" in result.stderr and "revision lock" in result.stderr.lower()

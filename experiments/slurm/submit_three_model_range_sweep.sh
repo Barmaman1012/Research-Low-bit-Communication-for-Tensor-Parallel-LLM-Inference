@@ -2,10 +2,11 @@
 # Submit only after reviewing this file and accepting the gated-model licenses.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-cd "$ROOT"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
 MANIFEST=experiments/three_model_range_sweep.yaml
-LOCK=experiments/three_model_range_sweep.revisions.json
+LOCK="$REPO_ROOT/experiments/three_model_range_sweep.revisions.json"
 MODELS=(gemma2_27b llama2_13b mistral_nemo_12b)
 PYTHON_BIN=${PYTHON_BIN:-.venv-gpu310/bin/python}
 DRY_RUN=false
