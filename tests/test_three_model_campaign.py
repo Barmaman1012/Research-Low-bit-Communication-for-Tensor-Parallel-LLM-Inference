@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,7 +94,7 @@ def test_dependency_graph_and_safe_no_argument_submission_behavior():
 
 def test_dry_run_has_no_sbatch_call_or_token_value():
     token = "test-token-must-never-appear"
-    env = dict(os.environ, HF_TOKEN=token, PYTHON_BIN="./.venv/bin/python")
+    env = dict(os.environ, HF_TOKEN=token, PYTHON_BIN=sys.executable)
     result = subprocess.run(
         ["bash", "experiments/slurm/submit_three_model_range_sweep.sh", "--dry-run", "--stage-only", "b"],
         cwd=ROOT, env=env, text=True, capture_output=True,
@@ -115,7 +116,7 @@ def test_submitter_finds_repository_when_started_outside_repository(tmp_path):
     token = "token-never-in-dry-run"
     result = subprocess.run(
         ["bash", str(ROOT / "experiments/slurm/submit_three_model_range_sweep.sh"), "--dry-run", "--stage-only", "b"],
-        cwd=tmp_path, env=dict(os.environ, HF_TOKEN=token, PYTHON_BIN=str(ROOT / ".venv/bin/python")),
+        cwd=tmp_path, env=dict(os.environ, HF_TOKEN=token, PYTHON_BIN=sys.executable),
         text=True, capture_output=True,
     )
     assert result.returncode == 0
@@ -143,14 +144,29 @@ def test_spooled_stage_uses_submit_dir_and_reports_missing_venv(tmp_path):
     spool = tmp_path / "cm/local/apps/slurm/var/spool/job1"; spool.mkdir(parents=True)
     copied = spool / "slurm_script"
     copied.write_text((ROOT / "experiments/slurm/stage_b_load_smoke.sbatch").read_text())
+    fake_repo = tmp_path / "fake-repository"
+    for relative in (
+        "experiments/three_model_range_sweep.yaml",
+        "experiments/three_model_range_sweep.revisions.json",
+        "scripts/three_model_campaign.py",
+    ):
+        marker = fake_repo / relative
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("marker")
+    real_outputs = ROOT / "outputs" / "three_model_range_sweep" / "gemma2_27b"
+    before = sorted(real_outputs.rglob("*")) if real_outputs.exists() else []
     result = subprocess.run(
-        ["bash", str(copied), "gemma2_27b", str(ROOT / "experiments/three_model_range_sweep.revisions.json")],
-        env=dict(os.environ, SLURM_SUBMIT_DIR=str(ROOT), SLURM_JOB_ID="1", HF_TOKEN="fake"),
+        ["bash", str(copied), "gemma2_27b", str(fake_repo / "experiments/three_model_range_sweep.revisions.json")],
+        env=dict(os.environ, SLURM_SUBMIT_DIR=str(fake_repo), SLURM_JOB_ID="1", HF_TOKEN="fake"),
         text=True, capture_output=True,
     )
     assert result.returncode == 2
-    assert f"ROOT={ROOT}" in result.stderr
+    assert f"ROOT={fake_repo}" in result.stderr
     assert str(spool) not in result.stderr
+    assert str(fake_repo / ".venv-gpu310/bin/activate") in result.stderr
+    assert "model_loading_smoke.py" not in result.stdout + result.stderr
+    after = sorted(real_outputs.rglob("*")) if real_outputs.exists() else []
+    assert after == before
 
 
 def test_stage_rejects_missing_lock_before_activation(tmp_path):

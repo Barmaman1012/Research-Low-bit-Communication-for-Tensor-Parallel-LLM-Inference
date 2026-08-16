@@ -12,7 +12,7 @@ MODEL_KEY=${1:?usage: sbatch stage_c_calibrate.sbatch MODEL_KEY REVISION_LOCK}
 LOCK_INPUT=${2:?usage: sbatch stage_c_calibrate.sbatch MODEL_KEY REVISION_LOCK}
 ROOT=${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}
 if [[ ! -f "$ROOT/experiments/three_model_range_sweep.yaml" || ! -f "$ROOT/experiments/three_model_range_sweep.revisions.json" || ! -f "$ROOT/scripts/three_model_campaign.py" || ! -f "$ROOT/.venv-gpu310/bin/activate" ]]; then
-  echo "Invalid campaign repository ROOT=$ROOT; required manifest, revision lock, campaign helper, and .venv-gpu310." >&2; exit 2
+  echo "Invalid campaign repository ROOT=$ROOT; required manifest, revision lock, campaign helper, and activation $ROOT/.venv-gpu310/bin/activate." >&2; exit 2
 fi
 cd "$ROOT"
 LOCK=$LOCK_INPUT; [[ "$LOCK" = /* ]] || LOCK="$ROOT/$LOCK"
