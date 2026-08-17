@@ -30,7 +30,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze calibration ranges on CPU; does not load a model.")
     parser.add_argument("--calibration_path", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--thresholds",
+        default=None,
+        help="Comma-separated positive finite median-normalized thresholds; preserves declared order.",
+    )
     return parser.parse_args()
+
+
+def parse_thresholds(raw: str | None) -> list[float]:
+    """Parse an explicit grid without changing the legacy default when omitted."""
+    if raw is None:
+        return list(THRESHOLDS)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("--thresholds must be a non-empty comma-separated list.")
+    values: list[float] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            raise ValueError("--thresholds contains an empty threshold.")
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid threshold {token!r} in --thresholds.") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"Thresholds must be finite and strictly positive; got {token!r}.")
+        if value in values:
+            raise ValueError(f"Duplicate threshold {value:g} in --thresholds.")
+        values.append(value)
+    return values
 
 
 def parse_module_name(module_name: str) -> tuple[int, str]:
@@ -60,7 +88,10 @@ def threshold_column_name(threshold: float) -> str:
     return f"count_ge_{threshold:g}x_median".replace(".", "_")
 
 
-def extract_module_records(calibration: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def extract_module_records(
+    calibration: dict[str, Any], thresholds: list[float] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    thresholds = list(THRESHOLDS if thresholds is None else thresholds)
     modules = calibration.get("modules")
     if not isinstance(modules, dict) or not modules:
         raise ValueError("Calibration artifact must contain a non-empty 'modules' mapping.")
@@ -95,7 +126,7 @@ def extract_module_records(calibration: dict[str, Any]) -> tuple[list[dict[str, 
             "maximum_over_median": maximum / median, "existing_topk_boundary": topk_boundary,
             "existing_topk_concentration": concentration,
         }
-        for threshold in (1.2, 1.5, 2, 3, 4, 8, 16):
+        for threshold in thresholds:
             count = int((median_norm >= threshold).sum())
             summary[threshold_column_name(float(threshold))] = count
             summary[threshold_column_name(float(threshold)).replace("count_", "fraction_")] = count / feature_dim
@@ -181,8 +212,10 @@ def _plots(records: list[dict[str, Any]], summaries: list[dict[str, Any]], thres
 def main() -> None:
     args = parse_args(); calibration_path = Path(args.calibration_path); output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    thresholds = parse_thresholds(args.thresholds)
     calibration = torch.load(calibration_path, map_location="cpu", weights_only=False)
-    records, summaries = extract_module_records(calibration); threshold_rows = threshold_summary(records, summaries)
+    records, summaries = extract_module_records(calibration, thresholds=thresholds)
+    threshold_rows = threshold_summary(records, summaries, thresholds=thresholds)
     _write_csv(output_dir / "calibration_feature_ranges.csv.gz", records, gzip_output=True)
     _write_csv(output_dir / "calibration_module_ranges.csv", summaries)
     _write_csv(output_dir / "threshold_summary.csv", threshold_rows)
@@ -191,6 +224,7 @@ def main() -> None:
                   "model_revision": calibration.get("resolved_model_revision", calibration.get("model_revision")),
                   "tokenizer_revision": calibration.get("resolved_tokenizer_revision", calibration.get("tokenizer_revision")),
                   "calibration_parameters": {key: calibration.get(key) for key in ("gamma", "k_fraction", "num_sequences", "sequence_length", "num_partitions", "sampling_strategy", "seed")},
+                  "analyzed_thresholds": thresholds,
                   "source_git_commit": calibration.get("git_commit"), "analysis_git_commit": _git_commit(),
                   "python_version": platform.python_version(), "torch_version": torch.__version__}
     (output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")

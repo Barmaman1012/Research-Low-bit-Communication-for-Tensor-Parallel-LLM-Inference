@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import csv
+import hashlib
+import json
 from pathlib import Path
+import sys
 
 import pytest
 import torch
@@ -54,6 +58,45 @@ def test_threshold_counts_and_average_bit_calculation() -> None:
     assert row["average_bits_per_value"] == 16 * (3 / 8) + 4 * (5 / 8)
     assert row["minimum_module_count"] == 1
     assert row["maximum_module_count"] == 2
+
+
+def test_explicit_thresholds_drive_csv_inclusively_and_do_not_modify_calibration(tmp_path, monkeypatch) -> None:
+    module = _module()
+    calibration_path = tmp_path / "calibration.pt"
+    calibration = {"modules": {
+        "model.layers.0.self_attn.o_proj": _payload([1, 2, 4, 8]),
+        "model.layers.0.mlp.down_proj": _payload([1, 1, 1, 4]),
+    }}
+    torch.save(calibration, calibration_path)
+    before = hashlib.sha256(calibration_path.read_bytes()).hexdigest()
+    output_dir = tmp_path / "analysis"
+    monkeypatch.setattr(module, "_plots", lambda *_args: None)
+    monkeypatch.setattr(sys, "argv", ["analyze_calibration_ranges.py", "--calibration_path", str(calibration_path),
+                                       "--output_dir", str(output_dir), "--thresholds", "1.0,1.6,2.1,2.3"])
+    module.main()
+    with (output_dir / "threshold_summary.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [float(row["threshold"]) for row in rows] == [1.0, 1.6, 2.1, 2.3]
+    # [1, 2, 4, 8] has median 2, so 2 is included by >= 1.0.
+    assert int(rows[0]["selected_count"]) == 7
+    provenance = json.loads((output_dir / "provenance.json").read_text())
+    assert provenance["analyzed_thresholds"] == [1.0, 1.6, 2.1, 2.3]
+    assert hashlib.sha256(calibration_path.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize("raw", ["", "1.0,,2.0", "zero", "0", "-1", "nan", "inf", "1.0,1.0"])
+def test_rejects_malformed_nonpositive_nonfinite_or_duplicate_thresholds(raw: str) -> None:
+    module = _module()
+    with pytest.raises(ValueError):
+        module.parse_thresholds(raw)
+
+
+def test_legacy_default_threshold_grid_is_unchanged() -> None:
+    module = _module()
+    assert module.parse_thresholds(None) == module.THRESHOLDS
+    calibration = {"modules": {"model.layers.0.mlp.down_proj": _payload([1, 2, 4, 8])}}
+    _records, summaries = module.extract_module_records(calibration)
+    assert "count_ge_1_05x_median" in summaries[0]
 
 
 def test_module_name_parsing() -> None:

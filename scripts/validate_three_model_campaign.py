@@ -72,10 +72,6 @@ def run_calibration_validation(args: argparse.Namespace) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Calibration artifact does not exist: {path}")
     output = Path(args.output_path)
-    if output.exists():
-        raise FileExistsError(f"Refusing to overwrite validation report: {output}")
-    if args.analysis_output_dir and Path(args.analysis_output_dir).exists():
-        raise FileExistsError(f"Refusing to overwrite range analysis directory: {args.analysis_output_dir}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     report = validate_calibration(payload, spec, manifest["calibration"])
     digest = sha256(path)
@@ -90,7 +86,8 @@ def run_calibration_validation(args: argparse.Namespace) -> None:
                    "model_revision": spec["model_revision"], "tokenizer_revision": spec["tokenizer_revision"]})
     if args.analysis_output_dir:
         subprocess.run([sys.executable, str(ROOT / "scripts" / "analyze_calibration_ranges.py"),
-                        "--calibration_path", str(path), "--output_dir", args.analysis_output_dir], check=True, cwd=ROOT)
+                        "--calibration_path", str(path), "--output_dir", args.analysis_output_dir,
+                        "--thresholds", args.thresholds], check=True, cwd=ROOT)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
@@ -103,6 +100,7 @@ def main() -> None:
     calibration.add_argument("--lock", required=True); calibration.add_argument("--model-key", required=True)
     calibration.add_argument("--calibration-path", required=True); calibration.add_argument("--output-path", required=True)
     calibration.add_argument("--analysis-output-dir", required=True)
+    calibration.add_argument("--thresholds", required=True)
     args = parser.parse_args()
     if args.command == "calibration": run_calibration_validation(args)
 

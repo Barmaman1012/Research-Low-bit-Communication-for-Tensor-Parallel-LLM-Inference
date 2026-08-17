@@ -67,6 +67,13 @@ def test_lookup_command_and_calibration_command_are_locked():
     assert "--num_partitions 8" in joined and "--target_style llama" in joined
 
 
+def test_stage_d_passes_exact_ordered_manifest_threshold_grid():
+    c, manifest, lock = manifest_and_lock()
+    command = c.command_for_stage("d", "mistral_nemo_12b", manifest, lock, job_id="123")
+    threshold_arg = command[command.index("--thresholds") + 1]
+    assert threshold_arg == ",".join(str(value) for value in manifest["range_thresholds"])
+
+
 def test_stage_b_and_eval_commands_have_expected_unique_outputs():
     c, manifest, lock = manifest_and_lock()
     b = c.command_for_stage("b", "gemma2_27b", manifest, lock, job_id="123")

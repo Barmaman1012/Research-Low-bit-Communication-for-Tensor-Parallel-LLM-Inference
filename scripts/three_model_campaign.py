@@ -162,7 +162,8 @@ def command_for_stage(
         return base + [str(ROOT / "scripts" / "validate_three_model_campaign.py"), "calibration",
                        "--manifest", str(DEFAULT_MANIFEST), "--lock", str(lock_path), "--model-key", model_key,
                        "--calibration-path", str(spec["calibration_path"]), "--output-path", str(validation),
-                       "--analysis-output-dir", str(analysis)]
+                       "--analysis-output-dir", str(analysis),
+                       "--thresholds", ",".join(str(value) for value in manifest["range_thresholds"])]
     if array_index is None:
         raise ValueError(f"Stage {stage} requires an array index.")
     mode, threshold = configuration_for_index(manifest, array_index)
